@@ -4,8 +4,9 @@ from .models import Product, PriceList
 from .repository import PriceListRepository
 from .tagging import TagRule, Tagger
 from .comparator import PriceComparator
-from .search import ProductSearch
+from .gui import PriceCompareApp, run_app
 from .io import PriceListImporter, PriceListExporter
+from .search import ProductSearch
 
 __all__ = [
     "Product",
@@ -14,7 +15,9 @@ __all__ = [
     "TagRule",
     "Tagger",
     "PriceComparator",
+    "PriceCompareApp",
     "ProductSearch",
     "PriceListImporter",
     "PriceListExporter",
+    "run_app",
 ]
