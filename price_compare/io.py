@@ -136,8 +136,13 @@ class PriceListImporter:
         path = Path(path)
         suffix = path.suffix.lower()
         if suffix == ".csv":
+            dialect, delimiter = self._detect_csv_format(path)
             with path.open("r", encoding="utf-8-sig", newline="") as fp:
-                reader = csv.reader(fp)
+                reader = (
+                    csv.reader(fp, dialect=dialect)
+                    if dialect is not None
+                    else csv.reader(fp, delimiter=delimiter)
+                )
                 try:
                     headers = next(reader)
                 except StopIteration:
@@ -189,8 +194,13 @@ class PriceListImporter:
         rows: list[dict[str, str]] = []
 
         if suffix == ".csv":
+            dialect, delimiter = self._detect_csv_format(path)
             with path.open("r", encoding="utf-8-sig", newline="") as fp:
-                reader = csv.DictReader(fp)
+                reader = (
+                    csv.DictReader(fp, dialect=dialect)
+                    if dialect is not None
+                    else csv.DictReader(fp, delimiter=delimiter)
+                )
                 headers = [
                     str(header).strip()
                     for header in (reader.fieldnames or [])
@@ -311,8 +321,13 @@ class PriceListImporter:
         supplier: str | None,
         column_mapping: dict[str, str | Sequence[str]] | None,
     ) -> Iterable[Product]:
+        dialect, delimiter = self._detect_csv_format(path)
         with path.open("r", encoding="utf-8-sig", newline="") as fp:
-            reader = csv.DictReader(fp)
+            reader = (
+                csv.DictReader(fp, dialect=dialect)
+                if dialect is not None
+                else csv.DictReader(fp, delimiter=delimiter)
+            )
             headers = reader.fieldnames or []
             mapping = self._prepare_column_mapping(headers, column_mapping, path)
             used_columns = set(mapping.values())
@@ -620,6 +635,36 @@ class PriceListImporter:
             )
 
         return resolved
+
+    def _detect_csv_format(self, path: Path) -> tuple[csv.Dialect | None, str]:
+        """Detect CSV dialect and delimiter, falling back to sensible defaults."""
+
+        sample = ""
+        with path.open("r", encoding="utf-8-sig", newline="") as fp:
+            sample = fp.read(4096)
+
+        dialect: csv.Dialect | None = None
+        if sample:
+            try:
+                dialect = csv.Sniffer().sniff(sample)
+            except csv.Error:
+                dialect = None
+
+        if dialect is not None:
+            delimiter = getattr(dialect, "delimiter", ",") or ","
+            return dialect, delimiter
+
+        delimiter = self._guess_delimiter(sample)
+        return None, delimiter
+
+    @staticmethod
+    def _guess_delimiter(sample: str) -> str:
+        candidates = [",", ";", "\t", "|"]
+        counts = {candidate: sample.count(candidate) for candidate in candidates}
+        best_candidate = max(candidates, key=lambda candidate: counts[candidate])
+        if counts[best_candidate] == 0:
+            return ","
+        return best_candidate
 
     @staticmethod
     def _extract_cell(row: dict[str, object], column: str | None) -> str:
