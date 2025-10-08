@@ -7,6 +7,29 @@ import json
 from pathlib import Path
 from typing import Iterable, Sequence
 
+
+class MissingRequiredColumnsError(ValueError):
+    """Raised when required columns cannot be resolved during import."""
+
+    def __init__(
+        self,
+        missing: Sequence[str],
+        path: Path,
+        headers: Sequence[str],
+        resolved: dict[str, str],
+    ) -> None:
+        self.missing = tuple(missing)
+        self.path = Path(path)
+        self.headers = tuple(headers)
+        self.resolved = dict(resolved)
+        message = (
+            "Missing required columns {} in file '{}'. You can provide a column_mapping "
+            "or extend column_aliases to match supplier headers.".format(
+                list(missing), path
+            )
+        )
+        super().__init__(message)
+
 try:
     from openpyxl import Workbook, load_workbook
 except ImportError:  # pragma: no cover - optional dependency
@@ -397,9 +420,16 @@ class PriceListImporter:
 
         missing = sorted(self.required_fields - set(resolved))
         if missing:
-            raise ValueError(
-                "Missing required columns {} in file '{}'. You can provide a column_mapping "
-                "or extend column_aliases to match supplier headers.".format(missing, path)
+            available_headers = [
+                str(header)
+                for header in headers
+                if header is not None and str(header).strip()
+            ]
+            raise MissingRequiredColumnsError(
+                missing=missing,
+                path=path,
+                headers=available_headers,
+                resolved=resolved,
             )
 
         return resolved
