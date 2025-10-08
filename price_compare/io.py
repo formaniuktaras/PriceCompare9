@@ -95,6 +95,10 @@ class PriceListImporter:
             for field, aliases in default_aliases.items()
         }
 
+        self.optional_fields = tuple(
+            sorted(field for field in self.column_aliases if field not in self.required_fields)
+        )
+
     def load(
         self,
         path: str | Path,
@@ -117,6 +121,189 @@ class PriceListImporter:
         price_list = PriceList(supplier=supplier_name, products=products)
         price_list.sort_products()
         return price_list
+
+    def detect_headers(self, path: str | Path) -> list[str]:
+        """Return a list of header names found in the supplied file."""
+
+        headers, rows = self.peek(path, limit=0)
+        if headers:
+            return headers
+        if rows:
+            # When rows are provided we can derive headers from the first row keys.
+            first_row = rows[0]
+            return list(first_row.keys())
+
+        path = Path(path)
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            with path.open("r", encoding="utf-8-sig", newline="") as fp:
+                reader = csv.reader(fp)
+                try:
+                    headers = next(reader)
+                except StopIteration:
+                    return []
+            return [str(header).strip() for header in headers if str(header).strip()]
+
+        if suffix == ".json":
+            with path.open("r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+            products_data = payload.get("products") if isinstance(payload, dict) else None
+            if not isinstance(products_data, list):
+                return []
+            headers: list[str] = []
+            for item in products_data:
+                if not isinstance(item, dict):
+                    continue
+                for key in item.keys():
+                    key_str = str(key)
+                    if key_str not in headers:
+                        headers.append(key_str)
+            return headers
+
+        if suffix == ".xlsx":
+            if load_workbook is None:
+                raise ValueError("Імпорт Excel недоступний. Встановіть залежність 'openpyxl'.")
+            workbook = load_workbook(path, data_only=True)
+            sheet = workbook.active
+            rows_iter = sheet.iter_rows(min_row=1, values_only=True)
+            try:
+                headers_row = next(rows_iter)
+            except StopIteration:
+                return []
+            headers = [
+                str(value).strip() if value is not None else ""
+                for value in headers_row
+            ]
+            return [header for header in headers if header]
+
+        return []
+
+    def peek(
+        self, path: str | Path, *, limit: int = 10
+    ) -> tuple[list[str], list[dict[str, str]]]:
+        """Return headers and a preview of rows from the provided file."""
+
+        path = Path(path)
+        suffix = path.suffix.lower()
+        headers: list[str] = []
+        rows: list[dict[str, str]] = []
+
+        if suffix == ".csv":
+            with path.open("r", encoding="utf-8-sig", newline="") as fp:
+                reader = csv.DictReader(fp)
+                headers = [
+                    str(header).strip()
+                    for header in (reader.fieldnames or [])
+                    if header is not None and str(header).strip()
+                ]
+                if limit == 0:
+                    return headers, rows
+                for index, row in enumerate(reader):
+                    if limit and index >= limit:
+                        break
+                    rows.append({header: str(row.get(header, "")) for header in headers})
+            return headers, rows
+
+        if suffix == ".json":
+            with path.open("r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+
+            products_data = payload.get("products") if isinstance(payload, dict) else None
+            if isinstance(products_data, list):
+                for item in products_data:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in item.keys():
+                        key_str = str(key)
+                        if key_str not in headers:
+                            headers.append(key_str)
+                if limit == 0:
+                    return headers, rows
+                for item in products_data[: limit or None]:
+                    if not isinstance(item, dict):
+                        continue
+                    rows.append({header: str(item.get(header, "")) for header in headers})
+            return headers, rows
+
+        if suffix == ".xlsx":
+            if load_workbook is None:
+                raise ValueError("Імпорт Excel недоступний. Встановіть залежність 'openpyxl'.")
+
+            workbook = load_workbook(path, data_only=True)
+            sheet = workbook.active
+            rows_iter = sheet.iter_rows(min_row=1, values_only=True)
+
+            try:
+                headers_row = next(rows_iter)
+            except StopIteration:
+                return headers, rows
+
+            headers = [
+                str(value).strip() if value is not None else ""
+                for value in headers_row
+            ]
+            headers = [header for header in headers if header]
+
+            if limit == 0:
+                return headers, rows
+
+            for index, values in enumerate(rows_iter):
+                if limit and index >= limit:
+                    break
+                row_dict = {}
+                for idx, header in enumerate(headers):
+                    if idx < len(values):
+                        value = values[idx]
+                    else:
+                        value = ""
+                    row_dict[header] = "" if value is None else str(value)
+                rows.append(row_dict)
+            return headers, rows
+
+        raise ValueError(f"Unsupported import format '{suffix}'.")
+
+    def suggest_mapping(
+        self,
+        headers: Sequence[str],
+        column_mapping: dict[str, str | Sequence[str]] | None = None,
+    ) -> dict[str, str]:
+        """Suggest column mapping for given headers without enforcing required fields."""
+
+        normalized_headers = {
+            str(header).strip().lower(): str(header)
+            for header in headers
+            if header is not None and str(header).strip()
+        }
+
+        resolved: dict[str, str] = {}
+
+        def iter_override(field: str) -> Iterable[str]:
+            if not column_mapping or field not in column_mapping:
+                return []
+            value = column_mapping[field]
+            if isinstance(value, str):
+                return [value]
+            return [str(candidate) for candidate in value]
+
+        for field, aliases in self.column_aliases.items():
+            override_candidates = [
+                str(candidate).strip().lower()
+                for candidate in iter_override(field)
+                if str(candidate).strip()
+            ]
+            candidates = override_candidates + [
+                alias for alias in aliases if alias not in override_candidates
+            ]
+
+            for candidate in candidates:
+                candidate_key = candidate.strip().lower()
+                if not candidate_key:
+                    continue
+                if candidate_key in normalized_headers:
+                    resolved[field] = normalized_headers[candidate_key]
+                    break
+
+        return resolved
 
     def _load_csv(
         self,
