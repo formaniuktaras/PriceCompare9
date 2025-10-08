@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -18,6 +19,10 @@ from .templates import ImportTemplate, ImportTemplateStore
 
 def _format_price(product: Product) -> str:
     return f"{product.price:,.2f} {product.currency}".replace(",", " ")
+
+
+STORE_PRICE_FILENAME = "store_price.json"
+STORE_SUPPLIER_NAME = "Мій інтернет-магазин"
 
 
 class PriceCompareApp(tk.Tk):
@@ -42,6 +47,8 @@ class PriceCompareApp(tk.Tk):
         self._tags_config_path: str | None = str(tags_config) if tags_config else None
 
         self.price_lists: Dict[str, PriceList] = {}
+        self.store_price_list: PriceList | None = None
+        self._store_price_path = self.repository.data_dir / STORE_PRICE_FILENAME
 
         self._create_menu()
         self._create_widgets()
@@ -54,20 +61,20 @@ class PriceCompareApp(tk.Tk):
         container = ttk.Notebook(self)
         container.pack(fill=tk.BOTH, expand=True)
 
+        self.main_price_tab = ttk.Frame(container)
         self.catalog_tab = ttk.Frame(container)
         self.search_tab = ttk.Frame(container)
         self.compare_tab = ttk.Frame(container)
-        self.best_tab = ttk.Frame(container)
 
+        container.add(self.main_price_tab, text="Основний прайс")
         container.add(self.catalog_tab, text="Каталог постачальників")
         container.add(self.search_tab, text="Пошук")
         container.add(self.compare_tab, text="Порівняння")
-        container.add(self.best_tab, text="Найкращі пропозиції")
 
+        self._build_main_price_tab()
         self._build_catalog_tab()
         self._build_search_tab()
         self._build_compare_tab()
-        self._build_best_tab()
 
     def _create_menu(self) -> None:
         menubar = tk.Menu(self)
@@ -81,6 +88,40 @@ class PriceCompareApp(tk.Tk):
         )
         settings_menu.add_separator()
         settings_menu.add_command(label="Вийти", command=self.destroy)
+
+    def _build_main_price_tab(self) -> None:
+        toolbar = ttk.Frame(self.main_price_tab)
+        toolbar.pack(fill=tk.X, padx=8, pady=8)
+
+        ttk.Button(
+            toolbar,
+            text="Завантажити прайс магазину",
+            command=self._import_store_price,
+        ).pack(side=tk.LEFT)
+
+        self.store_status_var = tk.StringVar(value="Прайс не завантажено.")
+        ttk.Label(toolbar, textvariable=self.store_status_var).pack(
+            side=tk.LEFT, padx=(12, 0)
+        )
+
+        columns = ("sku", "name", "price", "tags")
+        self.store_tree = ttk.Treeview(
+            self.main_price_tab,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+        )
+        headers = {
+            "sku": "SKU",
+            "name": "Назва",
+            "price": "Ціна",
+            "tags": "Теги",
+        }
+        widths = {"sku": 140, "name": 360, "price": 120, "tags": 220}
+        for column in columns:
+            self.store_tree.heading(column, text=headers[column])
+            self.store_tree.column(column, width=widths[column], anchor=tk.W)
+        self.store_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
     def _build_catalog_tab(self) -> None:
         toolbar = ttk.Frame(self.catalog_tab)
@@ -259,35 +300,6 @@ class PriceCompareApp(tk.Tk):
 
         self.comparison_results: List[Product] = []
 
-    def _build_best_tab(self) -> None:
-        actions = ttk.Frame(self.best_tab)
-        actions.pack(fill=tk.X, padx=8, pady=8)
-        ttk.Button(actions, text="Оновити", command=self._show_best_offers).pack(side=tk.LEFT)
-        ttk.Button(actions, text="Експорт", command=self._export_best_offers).pack(
-            side=tk.LEFT, padx=8
-        )
-
-        columns = ("sku", "name", "supplier", "price")
-        self.best_tree = ttk.Treeview(
-            self.best_tab,
-            columns=columns,
-            show="headings",
-            selectmode="browse",
-        )
-        headers = {
-            "sku": "SKU",
-            "name": "Назва",
-            "supplier": "Постачальник",
-            "price": "Ціна",
-        }
-        widths = {"sku": 140, "name": 360, "supplier": 160, "price": 120}
-        for column in columns:
-            self.best_tree.heading(column, text=headers[column])
-            self.best_tree.column(column, width=widths[column], anchor=tk.W)
-        self.best_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
-
-        self.best_offers: List[Product] = []
-
     # ------------------------------------------------------------------
     # Data helpers
     # ------------------------------------------------------------------
@@ -300,7 +312,8 @@ class PriceCompareApp(tk.Tk):
         self._populate_suppliers()
         self._populate_supplier_dropdown()
         self._show_supplier_products()
-        self._show_best_offers()
+        self._load_store_price_from_disk()
+        self._update_store_tree()
 
     def _populate_suppliers(self) -> None:
         self.suppliers_list.delete(0, tk.END)
@@ -517,7 +530,7 @@ class PriceCompareApp(tk.Tk):
         threshold = float(self.threshold_var.get())
         limit = max(1, int(self.limit_var.get()))
 
-        search = ProductSearch(self.price_lists.values())
+        search = ProductSearch(self._all_price_lists())
         results = search.search(
             query,
             supplier=supplier,
@@ -576,7 +589,7 @@ class PriceCompareApp(tk.Tk):
             messagebox.showwarning("Порівняння", "Вкажіть SKU.")
             return
 
-        comparator = PriceComparator(self.price_lists.values())
+        comparator = PriceComparator(self._all_price_lists())
         entry = comparator.compare_by_sku(sku)
         offers = entry.offers if entry else []
         self._update_comparison_tree(offers)
@@ -587,7 +600,7 @@ class PriceCompareApp(tk.Tk):
             messagebox.showwarning("Порівняння", "Вкажіть назву товару.")
             return
 
-        comparator = PriceComparator(self.price_lists.values())
+        comparator = PriceComparator(self._all_price_lists())
         entries = comparator.compare_by_name(name, threshold=float(self.compare_threshold_var.get()))
         offers: List[Product] = []
         for entry in entries:
@@ -627,50 +640,184 @@ class PriceCompareApp(tk.Tk):
 
         messagebox.showinfo("Готово", "Дані експортовано.")
 
-    # ------------------------------------------------------------------
-    # Best offers
-    # ------------------------------------------------------------------
-    def _show_best_offers(self) -> None:
-        for item in self.best_tree.get_children():
-            self.best_tree.delete(item)
-
-        comparator = PriceComparator(self.price_lists.values())
-        entries = comparator.best_offers()
-        offers: List[Product] = []
-        for entry in entries:
-            best = entry.best_offer
-            if best:
-                offers.append(best)
-
-        self.best_offers = sorted(offers, key=lambda product: product.price)
-
-        for product in self.best_offers:
-            self.best_tree.insert(
-                "",
-                tk.END,
-                values=(product.sku, product.name, product.supplier or "", _format_price(product)),
-            )
-
-    def _export_best_offers(self) -> None:
-        if not self.best_offers:
-            messagebox.showwarning("Експорт", "Немає пропозицій для експорту.")
-            return
-
-        path = filedialog.asksaveasfilename(
-            title="Зберегти найкращі пропозиції",
-            defaultextension=".csv",
-            filetypes=(("CSV файл", "*.csv"), ("JSON файл", "*.json")),
+    def _import_store_price(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Оберіть файл прайсу магазину",
+            filetypes=(
+                ("CSV файли", "*.csv"),
+                ("JSON файли", "*.json"),
+                ("XML файли", "*.xml"),
+                ("Excel файли", "*.xlsx"),
+                ("Усі підтримувані", "*.csv *.json *.xml *.xlsx"),
+            ),
         )
         if not path:
             return
 
+        supplier = STORE_SUPPLIER_NAME
+
         try:
-            self.exporter.export(self.best_offers, path)
+            headers, preview_rows = self.importer.peek(path, limit=15)
         except Exception as exc:
-            messagebox.showerror("Помилка", f"Не вдалося зберегти: {exc}")
+            messagebox.showerror(
+                "Помилка імпорту",
+                f"Не вдалося проаналізувати файл: {exc}",
+            )
             return
 
-        messagebox.showinfo("Готово", "Найкращі пропозиції експортовано.")
+        template = self.template_store.get_template(supplier)
+        available_templates = self.template_store.list_templates()
+
+        suggested_mapping = self.importer.suggest_mapping(
+            headers,
+            column_mapping=template.column_mapping if template else None,
+        )
+        initial_mapping = dict(suggested_mapping)
+        if template:
+            for field, column in template.column_mapping.items():
+                if column in headers:
+                    initial_mapping[field] = column
+
+        dialog = ImportSettingsDialog(
+            self,
+            path=path,
+            supplier=supplier,
+            headers=headers,
+            preview_rows=preview_rows,
+            required_fields=sorted(self.importer.required_fields),
+            optional_fields=list(self.importer.optional_fields),
+            initial_mapping=initial_mapping,
+            templates=available_templates,
+            current_template=template,
+        )
+        self.wait_window(dialog)
+
+        if not dialog.result:
+            return
+
+        column_mapping = dialog.result["column_mapping"]
+        save_template = dialog.result["save_template"]
+
+        try:
+            price_list = self.importer.load(
+                path, supplier=supplier, column_mapping=column_mapping
+            )
+        except MissingRequiredColumnsError as exc:
+            messagebox.showerror(
+                "Помилка імпорту",
+                "Не вдалося знайти обов'язкові колонки: {}.\nДоступні заголовки: {}.".format(
+                    ", ".join(exc.missing), ", ".join(exc.headers)
+                ),
+            )
+            return
+        except Exception as exc:
+            messagebox.showerror("Помилка імпорту", f"Не вдалося імпортувати прайс: {exc}")
+            return
+
+        self.tagger.apply(price_list.products)
+        self.store_price_list = price_list
+
+        try:
+            self._save_store_price(price_list)
+        except Exception as exc:
+            messagebox.showerror("Помилка", f"Не вдалося зберегти прайс магазину: {exc}")
+            return
+
+        if save_template:
+            self.template_store.save_template(supplier, column_mapping, headers)
+
+        messagebox.showinfo(
+            "Готово",
+            f"Завантажено {len(price_list.products)} позицій прайсу магазину.",
+        )
+        self._update_store_tree()
+
+    def _load_store_price_from_disk(self) -> None:
+        if not self._store_price_path.exists():
+            self.store_price_list = None
+            return
+
+        try:
+            with self._store_price_path.open("r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+        except Exception as exc:
+            messagebox.showerror(
+                "Помилка",
+                f"Не вдалося завантажити прайс магазину: {exc}",
+            )
+            self.store_price_list = None
+            return
+
+        products = [
+            Product(
+                sku=item["sku"],
+                name=item["name"],
+                price=item["price"],
+                currency=item.get("currency", "USD"),
+                description=item.get("description"),
+                supplier=payload.get("supplier", STORE_SUPPLIER_NAME),
+                tags=set(item.get("tags", [])),
+                extra=item.get("extra", {}),
+            )
+            for item in payload.get("products", [])
+        ]
+
+        supplier = payload.get("supplier") or STORE_SUPPLIER_NAME
+        self.store_price_list = PriceList(
+            supplier=supplier,
+            products=products,
+            metadata=payload.get("metadata", {}),
+        )
+
+    def _save_store_price(self, price_list: PriceList) -> None:
+        payload = {
+            "supplier": price_list.supplier,
+            "metadata": price_list.metadata,
+            "products": [
+                {
+                    "sku": product.sku,
+                    "name": product.name,
+                    "price": product.price,
+                    "currency": product.currency,
+                    "description": product.description,
+                    "tags": sorted(product.tags),
+                    "extra": product.extra,
+                }
+                for product in price_list.products
+            ],
+        }
+
+        with self._store_price_path.open("w", encoding="utf-8") as fp:
+            json.dump(payload, fp, indent=2, ensure_ascii=False)
+
+    def _update_store_tree(self) -> None:
+        for item in self.store_tree.get_children():
+            self.store_tree.delete(item)
+
+        if not self.store_price_list:
+            self.store_status_var.set("Прайс не завантажено.")
+            return
+
+        products = sorted(
+            self.store_price_list.products, key=lambda product: (product.sku, product.price)
+        )
+        self.store_status_var.set(
+            f"Завантажено {len(products)} позицій прайсу магазину."
+        )
+
+        for product in products:
+            tags = ", ".join(sorted(product.tags))
+            self.store_tree.insert(
+                "",
+                tk.END,
+                values=(product.sku, product.name, _format_price(product), tags),
+            )
+
+    def _all_price_lists(self) -> List[PriceList]:
+        lists = list(self.price_lists.values())
+        if self.store_price_list:
+            lists.append(self.store_price_list)
+        return lists
 
 
 class ImportSettingsDialog(tk.Toplevel):
