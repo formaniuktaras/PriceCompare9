@@ -5,14 +5,15 @@ from __future__ import annotations
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from .comparator import PriceComparator
-from .io import PriceListExporter, PriceListImporter
+from .io import MissingRequiredColumnsError, PriceListExporter, PriceListImporter
 from .models import PriceList, Product
 from .repository import PriceListRepository
 from .search import ProductSearch
 from .tagging import Tagger
+from .templates import ImportTemplate, ImportTemplateStore
 
 
 def _format_price(product: Product) -> str:
@@ -36,6 +37,7 @@ class PriceCompareApp(tk.Tk):
         self.repository = PriceListRepository(data_dir=data_dir)
         self.importer = PriceListImporter()
         self.exporter = PriceListExporter()
+        self.template_store = ImportTemplateStore(data_dir=data_dir)
         self.tagger = Tagger.from_json(tags_config) if tags_config else Tagger()
         self._tags_config_path: str | None = str(tags_config) if tags_config else None
 
@@ -362,12 +364,68 @@ class PriceCompareApp(tk.Tk):
             return
 
         try:
-            price_list = self.importer.load(path, supplier=supplier)
-            self.tagger.apply(price_list.products)
-            self.repository.save(price_list)
+            headers, preview_rows = self.importer.peek(path, limit=15)
+        except Exception as exc:
+            messagebox.showerror(
+                "Помилка імпорту",
+                f"Не вдалося проаналізувати файл: {exc}",
+            )
+            return
+
+        template = self.template_store.get_template(supplier)
+        available_templates = self.template_store.list_templates()
+
+        suggested_mapping = self.importer.suggest_mapping(
+            headers,
+            column_mapping=template.column_mapping if template else None,
+        )
+        initial_mapping = dict(suggested_mapping)
+        if template:
+            for field, column in template.column_mapping.items():
+                if column in headers:
+                    initial_mapping[field] = column
+
+        dialog = ImportSettingsDialog(
+            self,
+            path=path,
+            supplier=supplier,
+            headers=headers,
+            preview_rows=preview_rows,
+            required_fields=sorted(self.importer.required_fields),
+            optional_fields=list(self.importer.optional_fields),
+            initial_mapping=initial_mapping,
+            templates=available_templates,
+            current_template=template,
+        )
+        self.wait_window(dialog)
+
+        if not dialog.result:
+            return
+
+        column_mapping = dialog.result["column_mapping"]
+        save_template = dialog.result["save_template"]
+
+        try:
+            price_list = self.importer.load(
+                path, supplier=supplier, column_mapping=column_mapping
+            )
+        except MissingRequiredColumnsError as exc:
+            messagebox.showerror(
+                "Помилка імпорту",
+                "Не вдалося знайти обов'язкові колонки: {}.\nДоступні заголовки: {}.".format(
+                    ", ".join(exc.missing), ", ".join(exc.headers)
+                ),
+            )
+            return
         except Exception as exc:
             messagebox.showerror("Помилка імпорту", f"Не вдалося імпортувати прайс: {exc}")
             return
+
+        self.tagger.apply(price_list.products)
+        self.repository.save(price_list)
+
+        if save_template:
+            self.template_store.save_template(supplier, column_mapping, headers)
 
         messagebox.showinfo("Готово", f"Імпортовано {len(price_list.products)} позицій.")
         self.refresh_data()
@@ -611,6 +669,257 @@ class PriceCompareApp(tk.Tk):
             return
 
         messagebox.showinfo("Готово", "Найкращі пропозиції експортовано.")
+
+
+class ImportSettingsDialog(tk.Toplevel):
+    """Dialog window for configuring import column mapping."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        path: str,
+        supplier: str,
+        headers: Sequence[str],
+        preview_rows: Sequence[Dict[str, str]],
+        required_fields: Sequence[str],
+        optional_fields: Sequence[str],
+        initial_mapping: Dict[str, str],
+        templates: Sequence[ImportTemplate],
+        current_template: Optional[ImportTemplate],
+    ) -> None:
+        super().__init__(master)
+        self.title("Налаштування імпорту")
+        self.resizable(True, True)
+        self.transient(master)
+        self.grab_set()
+
+        self.headers = list(dict.fromkeys(headers))
+        self.preview_rows = list(preview_rows)
+        self.required_fields = list(required_fields)
+        self.optional_fields = list(optional_fields)
+        self.initial_mapping = dict(initial_mapping)
+        self.templates = list(templates)
+        self.current_template = current_template
+        self.result: Optional[Dict[str, object]] = None
+
+        self.column_vars: Dict[str, tk.StringVar] = {}
+        for field in self.required_fields + self.optional_fields:
+            self.column_vars[field] = tk.StringVar(value=self.initial_mapping.get(field, ""))
+
+        self.save_template_var = tk.BooleanVar(value=True)
+        self.template_var = tk.StringVar()
+
+        container = ttk.Frame(self, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        info_frame = ttk.Frame(container)
+        info_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(info_frame, text="Файл:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(info_frame, text=path, font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=1, sticky=tk.W, padx=(4, 0)
+        )
+        ttk.Label(info_frame, text="Постачальник:").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Label(info_frame, text=supplier).grid(row=1, column=1, sticky=tk.W, padx=(4, 0), pady=(4, 0))
+
+        template_names = ["Автовизначення"]
+        templates_by_name: Dict[str, ImportTemplate] = {}
+        for template in self.templates:
+            name = template.supplier
+            if name in templates_by_name:
+                continue
+            templates_by_name[name] = template
+            template_names.append(name)
+        self.templates_by_name = templates_by_name
+
+        if template_names[1:]:
+            template_frame = ttk.Frame(container)
+            template_frame.pack(fill=tk.X, pady=(0, 12))
+            ttk.Label(template_frame, text="Шаблон:").pack(side=tk.LEFT)
+            template_combo = ttk.Combobox(
+                template_frame,
+                state="readonly",
+                values=template_names,
+                textvariable=self.template_var,
+                width=40,
+            )
+            template_combo.pack(side=tk.LEFT, padx=(6, 0))
+            template_combo.bind("<<ComboboxSelected>>", self._on_template_selected)
+            ttk.Button(
+                template_frame,
+                text="Скинути",
+                command=self._use_initial_mapping,
+            ).pack(side=tk.LEFT, padx=(6, 0))
+        else:
+            self.template_var.set("Автовизначення")
+
+        mapping_frame = ttk.LabelFrame(container, text="Відповідність колонок")
+        mapping_frame.pack(fill=tk.X, pady=(0, 12))
+        mapping_frame.columnconfigure(1, weight=1)
+
+        combobox_values = [""] + self.headers
+        for row_index, field in enumerate(self.required_fields + self.optional_fields):
+            is_required = field in self.required_fields
+            label_text = field.upper() if field in {"sku", "name", "price"} else field
+            if is_required:
+                label_text = f"{label_text} *"
+            ttk.Label(mapping_frame, text=label_text).grid(
+                row=row_index, column=0, sticky=tk.W, padx=(6, 4), pady=4
+            )
+
+            combo = ttk.Combobox(
+                mapping_frame,
+                values=combobox_values,
+                textvariable=self.column_vars[field],
+                state="readonly",
+            )
+            combo.grid(row=row_index, column=1, sticky=tk.EW, padx=(0, 6), pady=4)
+
+        save_template_check = ttk.Checkbutton(
+            mapping_frame,
+            text="Зберегти як шаблон для постачальника",
+            variable=self.save_template_var,
+        )
+        save_template_check.grid(
+            row=len(self.required_fields + self.optional_fields),
+            column=0,
+            columnspan=2,
+            sticky=tk.W,
+            padx=6,
+            pady=(4, 0),
+        )
+
+        preview_frame = ttk.LabelFrame(container, text="Попередній перегляд")
+        preview_frame.pack(fill=tk.BOTH, expand=True)
+
+        if self.headers:
+            tree = ttk.Treeview(
+                preview_frame,
+                columns=self.headers,
+                show="headings",
+                height=8,
+            )
+            tree.grid(row=0, column=0, sticky="nsew")
+            preview_frame.columnconfigure(0, weight=1)
+            preview_frame.rowconfigure(0, weight=1)
+
+            y_scroll = ttk.Scrollbar(preview_frame, orient=tk.VERTICAL, command=tree.yview)
+            y_scroll.grid(row=0, column=1, sticky="ns")
+            x_scroll = ttk.Scrollbar(preview_frame, orient=tk.HORIZONTAL, command=tree.xview)
+            x_scroll.grid(row=1, column=0, sticky="ew")
+            tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+            for header in self.headers:
+                tree.heading(header, text=header)
+                tree.column(header, width=160, anchor=tk.W)
+
+            for row in self.preview_rows:
+                tree.insert(
+                    "",
+                    tk.END,
+                    values=[row.get(header, "") for header in self.headers],
+                )
+        else:
+            ttk.Label(
+                preview_frame,
+                text="Не вдалося визначити заголовки. Файл може бути порожнім.",
+            ).pack(padx=12, pady=12, anchor=tk.W)
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        buttons.columnconfigure(0, weight=1)
+
+        ttk.Button(buttons, text="Скасувати", command=self._on_cancel).grid(
+            row=0, column=1, padx=(0, 8)
+        )
+        ttk.Button(buttons, text="Імпортувати", command=self._on_ok).grid(row=0, column=2)
+
+        self.bind("<Return>", lambda _event: self._on_ok())
+        self.bind("<Escape>", lambda _event: self._on_cancel())
+
+        if current_template and current_template.supplier in self.templates_by_name:
+            self.template_var.set(current_template.supplier)
+            self._apply_mapping(current_template.column_mapping)
+        else:
+            self.template_var.set("Автовизначення")
+
+    def _use_initial_mapping(self) -> None:
+        self.template_var.set("Автовизначення")
+        self._apply_mapping(self.initial_mapping)
+
+    def _apply_mapping(self, mapping: Dict[str, str]) -> None:
+        for field, var in self.column_vars.items():
+            column = mapping.get(field, "")
+            if column not in self.headers:
+                column = ""
+            var.set(column)
+
+    def _on_template_selected(self, _event: object) -> None:
+        name = self.template_var.get()
+        if name == "Автовизначення":
+            self._apply_mapping(self.initial_mapping)
+            return
+        template = self.templates_by_name.get(name)
+        if template:
+            self._apply_mapping(template.column_mapping)
+
+    def _on_cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+    def _on_ok(self) -> None:
+        mapping: Dict[str, str] = {}
+        used_columns: set[str] = set()
+
+        for field, var in self.column_vars.items():
+            value = var.get().strip()
+            if not value:
+                if field in self.required_fields:
+                    messagebox.showerror(
+                        "Налаштування імпорту",
+                        "Необхідно обрати колонку для поля '{}'.".format(field),
+                        parent=self,
+                    )
+                    return
+                continue
+
+            if value not in self.headers:
+                messagebox.showerror(
+                    "Налаштування імпорту",
+                    "Колонку '{}' не знайдено у файлі.".format(value),
+                    parent=self,
+                )
+                return
+
+            if field in self.required_fields and value in used_columns:
+                messagebox.showerror(
+                    "Налаштування імпорту",
+                    "Колонка '{}' вже використовується для іншого обов'язкового поля.".format(
+                        value
+                    ),
+                    parent=self,
+                )
+                return
+
+            mapping[field] = value
+            if field in self.required_fields:
+                used_columns.add(value)
+
+        missing = [field for field in self.required_fields if field not in mapping]
+        if missing:
+            messagebox.showerror(
+                "Налаштування імпорту",
+                "Не вказано всі обов'язкові поля: {}.".format(", ".join(missing)),
+                parent=self,
+            )
+            return
+
+        self.result = {
+            "column_mapping": mapping,
+            "save_template": bool(self.save_template_var.get()),
+        }
+        self.destroy()
 
 
 def run_app(*, data_dir: str | Path = ".price_compare_data", tags_config: str | Path | None = None) -> None:
