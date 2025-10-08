@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
-from .comparator import PriceComparator
+from .comparison_engine import ComparisonBuilder, ComparisonGroup, SupplierMatch
+from .comparison_state import ComparisonStateStore
 from .io import MissingRequiredColumnsError, PriceListExporter, PriceListImporter
 from .models import PriceList, Product
 from .repository import PriceListRepository
@@ -45,6 +47,10 @@ class PriceCompareApp(tk.Tk):
         self.template_store = ImportTemplateStore(data_dir=data_dir)
         self.tagger = Tagger.from_json(tags_config) if tags_config else Tagger()
         self._tags_config_path: str | None = str(tags_config) if tags_config else None
+
+        self.comparison_state = ComparisonStateStore(
+            self.repository.data_dir / "comparison_state.json"
+        )
 
         self.price_lists: Dict[str, PriceList] = {}
         self.store_price_list: PriceList | None = None
@@ -244,61 +250,14 @@ class PriceCompareApp(tk.Tk):
         self.search_results: List[Product] = []
 
     def _build_compare_tab(self) -> None:
-        container = ttk.Frame(self.compare_tab)
-        container.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-
-        sku_frame = ttk.LabelFrame(container, text="Пошук за SKU")
-        sku_frame.pack(fill=tk.X, pady=(0, 8))
-
-        ttk.Label(sku_frame, text="SKU:").pack(side=tk.LEFT, padx=4, pady=4)
-        self.compare_sku_entry = ttk.Entry(sku_frame, width=24)
-        self.compare_sku_entry.pack(side=tk.LEFT, padx=4, pady=4)
-        ttk.Button(sku_frame, text="Знайти", command=self._compare_by_sku).pack(
-            side=tk.LEFT, padx=4, pady=4
+        self.comparison_board = ComparisonBoard(
+            self.compare_tab,
+            get_store_products=self._current_store_products,
+            get_supplier_lists=lambda: list(self.price_lists.values()),
+            state_store=self.comparison_state,
+            on_reload=self.refresh_data,
         )
-
-        name_frame = ttk.LabelFrame(container, text="Пошук за назвою")
-        name_frame.pack(fill=tk.X)
-
-        ttk.Label(name_frame, text="Назва:").grid(row=0, column=0, sticky=tk.W, padx=4, pady=4)
-        self.compare_name_entry = ttk.Entry(name_frame)
-        self.compare_name_entry.grid(row=0, column=1, sticky=tk.EW, padx=4, pady=4)
-
-        ttk.Label(name_frame, text="Поріг схожості:").grid(row=0, column=2, sticky=tk.W, padx=4, pady=4)
-        self.compare_threshold_var = tk.DoubleVar(value=0.75)
-        ttk.Scale(name_frame, from_=0.4, to=1.0, orient=tk.HORIZONTAL, variable=self.compare_threshold_var).grid(
-            row=0, column=3, sticky=tk.EW, padx=4, pady=4
-        )
-        ttk.Button(name_frame, text="Порівняти", command=self._compare_by_name).grid(
-            row=0, column=4, sticky=tk.W, padx=4, pady=4
-        )
-        name_frame.columnconfigure(1, weight=1)
-        name_frame.columnconfigure(3, weight=1)
-
-        ttk.Button(container, text="Експорт пропозицій", command=self._export_comparison).pack(
-            anchor=tk.W, pady=8
-        )
-
-        columns = ("sku", "name", "supplier", "price")
-        self.compare_tree = ttk.Treeview(
-            container,
-            columns=columns,
-            show="headings",
-            selectmode="browse",
-        )
-        headers = {
-            "sku": "SKU",
-            "name": "Назва",
-            "supplier": "Постачальник",
-            "price": "Ціна",
-        }
-        widths = {"sku": 140, "name": 320, "supplier": 160, "price": 120}
-        for column in columns:
-            self.compare_tree.heading(column, text=headers[column])
-            self.compare_tree.column(column, width=widths[column], anchor=tk.W)
-        self.compare_tree.pack(fill=tk.BOTH, expand=True)
-
-        self.comparison_results: List[Product] = []
+        self.comparison_board.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
     # ------------------------------------------------------------------
     # Data helpers
@@ -314,6 +273,8 @@ class PriceCompareApp(tk.Tk):
         self._show_supplier_products()
         self._load_store_price_from_disk()
         self._update_store_tree()
+        if hasattr(self, "comparison_board"):
+            self.comparison_board.refresh()
 
     def _populate_suppliers(self) -> None:
         self.suppliers_list.delete(0, tk.END)
@@ -580,66 +541,6 @@ class PriceCompareApp(tk.Tk):
 
         messagebox.showinfo("Готово", "Результати експортовано.")
 
-    # ------------------------------------------------------------------
-    # Comparison
-    # ------------------------------------------------------------------
-    def _compare_by_sku(self) -> None:
-        sku = self.compare_sku_entry.get().strip()
-        if not sku:
-            messagebox.showwarning("Порівняння", "Вкажіть SKU.")
-            return
-
-        comparator = PriceComparator(self._all_price_lists())
-        entry = comparator.compare_by_sku(sku)
-        offers = entry.offers if entry else []
-        self._update_comparison_tree(offers)
-
-    def _compare_by_name(self) -> None:
-        name = self.compare_name_entry.get().strip()
-        if not name:
-            messagebox.showwarning("Порівняння", "Вкажіть назву товару.")
-            return
-
-        comparator = PriceComparator(self._all_price_lists())
-        entries = comparator.compare_by_name(name, threshold=float(self.compare_threshold_var.get()))
-        offers: List[Product] = []
-        for entry in entries:
-            offers.extend(entry.offers)
-        self._update_comparison_tree(offers)
-
-    def _update_comparison_tree(self, offers: Sequence[Product]) -> None:
-        for item in self.compare_tree.get_children():
-            self.compare_tree.delete(item)
-
-        self.comparison_results = sorted(offers, key=lambda product: product.price)
-        for product in self.comparison_results:
-            self.compare_tree.insert(
-                "",
-                tk.END,
-                values=(product.sku, product.name, product.supplier or "", _format_price(product)),
-            )
-
-    def _export_comparison(self) -> None:
-        if not self.comparison_results:
-            messagebox.showwarning("Експорт", "Немає даних для експорту.")
-            return
-
-        path = filedialog.asksaveasfilename(
-            title="Зберегти пропозиції",
-            defaultextension=".csv",
-            filetypes=(("CSV файл", "*.csv"), ("JSON файл", "*.json")),
-        )
-        if not path:
-            return
-
-        try:
-            self.exporter.export(self.comparison_results, path)
-        except Exception as exc:
-            messagebox.showerror("Помилка", f"Не вдалося зберегти: {exc}")
-            return
-
-        messagebox.showinfo("Готово", "Дані експортовано.")
-
     def _import_store_price(self) -> None:
         path = filedialog.askopenfilename(
             title="Оберіть файл прайсу магазину",
@@ -731,6 +632,8 @@ class PriceCompareApp(tk.Tk):
             f"Завантажено {len(price_list.products)} позицій прайсу магазину.",
         )
         self._update_store_tree()
+        if hasattr(self, "comparison_board"):
+            self.comparison_board.refresh()
 
     def _load_store_price_from_disk(self) -> None:
         if not self._store_price_path.exists():
@@ -819,6 +722,576 @@ class PriceCompareApp(tk.Tk):
             lists.append(self.store_price_list)
         return lists
 
+    def _current_store_products(self) -> Sequence[Product]:
+        if not self.store_price_list:
+            return []
+        return list(self.store_price_list.products)
+
+
+@dataclass
+class ComparisonRow:
+    row_id: str
+    group_id: str
+    group_type: str
+    store_product: Product | None
+    supplier_match: SupplierMatch | None
+    similarity: float
+    status: str
+    group_has_matches: bool
+    match_id: str | None
+
+    @property
+    def supplier_product(self) -> Product | None:
+        return self.supplier_match.product if self.supplier_match else None
+
+    @property
+    def data_sku(self) -> str:
+        if self.supplier_match and self.supplier_match.product.sku:
+            return self.supplier_match.product.sku
+        if self.store_product and self.store_product.sku:
+            return self.store_product.sku
+        return ""
+
+
+class ComparisonBoard(ttk.Frame):
+    """Interactive table for comparing store products against suppliers."""
+
+    FILTER_OPTIONS = (
+        ("all", "Усі товари"),
+        ("has_matches", "Є збіги"),
+        ("no_matches", "Немає збігів"),
+        ("supplier_only", "Лише постачальники"),
+        ("confirmed", "Підтверджені"),
+        ("pending", "Непідтверджені"),
+    )
+
+    SORT_OPTIONS = (
+        ("name", "Назва (мій товар)"),
+        ("sku", "SKU (мій товар)"),
+        ("price", "Ціна (мій товар)"),
+        ("supplier_name", "Назва (постачальник)"),
+        ("supplier_price", "Ціна (постачальник)"),
+    )
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        get_store_products: Callable[[], Sequence[Product]],
+        get_supplier_lists: Callable[[], Sequence[PriceList]],
+        state_store: ComparisonStateStore,
+        on_reload: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(master)
+        self.get_store_products = get_store_products
+        self.get_supplier_lists = get_supplier_lists
+        self.state_store = state_store
+        self.on_reload = on_reload
+
+        self.min_similarity = 0.1
+        self.low_similarity_threshold = 0.45
+
+        self._ordered_rows: List[ComparisonRow] = []
+        self._rows: Dict[str, ComparisonRow] = {}
+        self._selection: Dict[str, bool] = {}
+        self._item_to_row: Dict[str, str] = {}
+        self._checkbox_meta: Dict[str, str] = {}
+
+        self.search_var = tk.StringVar()
+        self.threshold_var = tk.DoubleVar(value=0.6)
+        self.filter_var = tk.StringVar(value="all")
+        self.sort_var = tk.StringVar(value="name")
+
+        self._filter_label_to_key = {label: key for key, label in self.FILTER_OPTIONS}
+        self._sort_label_to_key = {label: key for key, label in self.SORT_OPTIONS}
+
+        self.filter_label_var = tk.StringVar(value=self._label_for_filter("all"))
+        self.sort_label_var = tk.StringVar(value=self._label_for_sort("name"))
+        self.threshold_display_var = tk.StringVar(value="60%")
+
+        self._build_ui()
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def refresh(self) -> None:
+        previous_selection = {row_id for row_id, selected in self._selection.items() if selected}
+        self._ordered_rows = self._rebuild_rows()
+        self._rows = {row.row_id: row for row in self._ordered_rows}
+        self._selection = {row.row_id: (row.row_id in previous_selection) for row in self._ordered_rows}
+        self._apply_filters()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        controls = ttk.Frame(self)
+        controls.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+        ttk.Label(controls, text="Пошук (назва/SKU):").grid(row=0, column=0, sticky=tk.W, padx=(0, 6))
+        search_entry = ttk.Entry(controls, textvariable=self.search_var)
+        search_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 12))
+        self.search_var.trace_add("write", lambda *_: self._apply_filters())
+
+        ttk.Label(controls, text="Поріг схожості:").grid(row=0, column=2, sticky=tk.W, padx=(0, 6))
+        threshold_scale = ttk.Scale(
+            controls,
+            from_=0.0,
+            to=1.0,
+            orient=tk.HORIZONTAL,
+            variable=self.threshold_var,
+            command=self._on_threshold_change,
+        )
+        threshold_scale.grid(row=0, column=3, sticky=tk.EW, padx=(0, 4))
+        ttk.Label(controls, textvariable=self.threshold_display_var).grid(
+            row=0, column=4, sticky=tk.W
+        )
+
+        ttk.Label(controls, text="Фільтр:").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
+        filter_combo = ttk.Combobox(
+            controls,
+            state="readonly",
+            values=list(self._filter_label_to_key.keys()),
+            textvariable=self.filter_label_var,
+            width=28,
+        )
+        filter_combo.grid(row=1, column=1, sticky=tk.W, pady=(8, 0))
+        filter_combo.bind("<<ComboboxSelected>>", self._on_filter_selected)
+
+        ttk.Label(controls, text="Сортування:").grid(row=1, column=2, sticky=tk.W, padx=(0, 6), pady=(8, 0))
+        sort_combo = ttk.Combobox(
+            controls,
+            state="readonly",
+            values=list(self._sort_label_to_key.keys()),
+            textvariable=self.sort_label_var,
+            width=28,
+        )
+        sort_combo.grid(row=1, column=3, sticky=tk.W, pady=(8, 0))
+        sort_combo.bind("<<ComboboxSelected>>", self._on_sort_selected)
+
+        controls.columnconfigure(1, weight=1)
+        controls.columnconfigure(3, weight=1)
+
+        actions = ttk.Frame(self)
+        actions.pack(fill=tk.X, padx=8, pady=(0, 6))
+        ttk.Button(actions, text="Підтвердити вибрані аналоги", command=self._confirm_selected).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(actions, text="Видалити вибрані", command=self._remove_selected).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(actions, text="Оновити результати", command=self._on_reload_clicked).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(actions, text="Показати тільки непідтверджені", command=self._focus_unconfirmed).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+
+        table_frame = ttk.Frame(self)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+        columns = (
+            "my_sku",
+            "my_name",
+            "my_tags",
+            "my_price",
+            "supplier",
+            "supplier_name",
+            "supplier_tags",
+            "supplier_price",
+            "similarity",
+            "checkbox",
+        )
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            selectmode="none",
+        )
+
+        headings = {
+            "my_sku": "Мій SKU",
+            "my_name": "Назва (мій товар)",
+            "my_tags": "Мітки",
+            "my_price": "Ціна",
+            "supplier": "Постачальник",
+            "supplier_name": "Назва (постачальник)",
+            "supplier_tags": "Мітки",
+            "supplier_price": "Ціна",
+            "similarity": "Схожість",
+            "checkbox": "✔",
+        }
+        widths = {
+            "my_sku": 140,
+            "my_name": 280,
+            "my_tags": 180,
+            "my_price": 120,
+            "supplier": 160,
+            "supplier_name": 280,
+            "supplier_tags": 180,
+            "supplier_price": 120,
+            "similarity": 90,
+            "checkbox": 80,
+        }
+        anchors = {
+            "my_price": tk.E,
+            "supplier_price": tk.E,
+            "similarity": tk.CENTER,
+            "checkbox": tk.CENTER,
+        }
+        for column in columns:
+            self.tree.heading(column, text=headings[column])
+            self.tree.column(
+                column,
+                width=widths[column],
+                anchor=anchors.get(column, tk.W),
+                stretch=(column != "checkbox"),
+            )
+
+        y_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        x_scroll = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        self.tree.tag_configure("match-full", background="#9bd179")
+        self.tree.tag_configure("match-low", background="#d1a3a7")
+        self.tree.tag_configure("match-none", background="")
+
+        self.tree.bind("<Button-1>", self._on_tree_click)
+
+    # ------------------------------------------------------------------
+    # Data preparation
+    # ------------------------------------------------------------------
+    def _rebuild_rows(self) -> List[ComparisonRow]:
+        store_products = list(self.get_store_products())
+        supplier_lists = list(self.get_supplier_lists())
+
+        builder = ComparisonBuilder(
+            store_products,
+            supplier_lists,
+            min_similarity=self.min_similarity,
+        )
+        groups = self._sort_groups(builder.build())
+
+        rows: List[ComparisonRow] = []
+        valid_pairs: List[tuple[str, str]] = []
+        for group in groups:
+            group_type = "supplier-only" if group.store_product is None else "store"
+            if group.supplier_matches:
+                for match in group.supplier_matches:
+                    valid_pairs.append((group.group_id, match.match_id))
+                    status = self.state_store.status_for(group.group_id, match.match_id)
+                    if status == "removed":
+                        continue
+                    if status is None and match.similarity >= 0.999:
+                        status = "confirmed"
+                        self.state_store.set_status(group.group_id, match.match_id, "confirmed")
+                    status = status or "pending"
+                    rows.append(
+                        ComparisonRow(
+                            row_id=f"{group.group_id}::{match.match_id}",
+                            group_id=group.group_id,
+                            group_type=group_type,
+                            store_product=group.store_product,
+                            supplier_match=match,
+                            similarity=match.similarity,
+                            status=status,
+                            group_has_matches=True,
+                            match_id=match.match_id,
+                        )
+                    )
+            else:
+                if group_type == "store":
+                    rows.append(
+                        ComparisonRow(
+                            row_id=f"{group.group_id}::store",
+                            group_id=group.group_id,
+                            group_type=group_type,
+                            store_product=group.store_product,
+                            supplier_match=None,
+                            similarity=0.0,
+                            status="pending",
+                            group_has_matches=False,
+                            match_id=None,
+                        )
+                    )
+
+        self.state_store.prune(valid_pairs)
+        self.state_store.save()
+        return rows
+
+    def _sort_groups(self, groups: List[ComparisonGroup]) -> List[ComparisonGroup]:
+        key = self.sort_var.get()
+
+        def store_name(group: ComparisonGroup) -> str:
+            if group.store_product:
+                return group.store_product.name.lower()
+            if group.supplier_matches:
+                return group.supplier_matches[0].product.name.lower()
+            return ""
+
+        def store_sku(group: ComparisonGroup) -> str:
+            if group.store_product and group.store_product.sku:
+                return group.store_product.sku.lower()
+            if group.supplier_matches and group.supplier_matches[0].product.sku:
+                return group.supplier_matches[0].product.sku.lower()
+            return ""
+
+        def supplier_name(group: ComparisonGroup) -> str:
+            if group.supplier_matches:
+                return group.supplier_matches[0].product.name.lower()
+            return store_name(group)
+
+        def store_price_value(group: ComparisonGroup) -> float:
+            if group.store_product:
+                return group.store_product.price
+            return float("inf")
+
+        def supplier_price_value(group: ComparisonGroup) -> float:
+            if group.supplier_matches:
+                return min(match.product.price for match in group.supplier_matches)
+            return float("inf")
+
+        if key == "sku":
+            return sorted(groups, key=lambda group: (store_sku(group), store_name(group)))
+        if key == "price":
+            return sorted(groups, key=lambda group: (store_price_value(group), store_name(group)))
+        if key == "supplier_name":
+            return sorted(groups, key=lambda group: supplier_name(group))
+        if key == "supplier_price":
+            return sorted(
+                groups,
+                key=lambda group: (supplier_price_value(group), supplier_name(group)),
+            )
+        return sorted(groups, key=lambda group: store_name(group))
+
+    # ------------------------------------------------------------------
+    # Filtering helpers
+    # ------------------------------------------------------------------
+    def _apply_filters(self) -> None:
+        filtered = [row for row in self._ordered_rows if self._passes_filters(row)]
+        self._populate_tree(filtered)
+
+    def _passes_filters(self, row: ComparisonRow) -> bool:
+        return (
+            self._passes_filter_option(row)
+            and self._passes_search(row)
+            and self._passes_threshold(row)
+        )
+
+    def _passes_filter_option(self, row: ComparisonRow) -> bool:
+        option = self.filter_var.get()
+        if option == "all":
+            return True
+        if option == "has_matches":
+            return row.group_type == "store" and row.group_has_matches
+        if option == "no_matches":
+            return row.group_type == "store" and not row.group_has_matches
+        if option == "supplier_only":
+            return row.group_type == "supplier-only"
+        if option == "confirmed":
+            return row.status == "confirmed"
+        if option == "pending":
+            return row.status not in {"confirmed", "removed"}
+        return True
+
+    def _passes_search(self, row: ComparisonRow) -> bool:
+        query = self.search_var.get().strip().lower()
+        if not query:
+            return True
+
+        haystacks: List[str] = []
+        if row.store_product:
+            haystacks.extend(
+                filter(
+                    None,
+                    [
+                        row.store_product.sku,
+                        row.store_product.name,
+                        " ".join(sorted(row.store_product.tags)),
+                    ],
+                )
+            )
+        supplier_product = row.supplier_product
+        if supplier_product:
+            haystacks.extend(
+                filter(
+                    None,
+                    [
+                        supplier_product.sku,
+                        supplier_product.name,
+                        supplier_product.supplier,
+                        " ".join(sorted(supplier_product.tags)),
+                    ],
+                )
+            )
+        return any(query in value.lower() for value in haystacks)
+
+    def _passes_threshold(self, row: ComparisonRow) -> bool:
+        if not row.supplier_match:
+            return True
+        threshold = float(self.threshold_var.get())
+        return row.similarity >= threshold
+
+    # ------------------------------------------------------------------
+    # Tree rendering
+    # ------------------------------------------------------------------
+    def _populate_tree(self, rows: Sequence[ComparisonRow]) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        self._item_to_row.clear()
+        self._checkbox_meta.clear()
+
+        for row in rows:
+            values = self._row_values(row)
+            item = self.tree.insert("", tk.END, values=values, tags=self._row_tags(row))
+            self._item_to_row[item] = row.row_id
+            self._checkbox_meta[row.row_id] = row.data_sku
+            checkbox_symbol = "☑" if self._selection.get(row.row_id) else "☐"
+            self.tree.set(item, "checkbox", checkbox_symbol)
+
+    def _row_values(self, row: ComparisonRow) -> tuple[str, ...]:
+        store_product = row.store_product
+        supplier_product = row.supplier_product
+
+        my_sku = store_product.sku if store_product else "—"
+        my_name = store_product.name if store_product else "—"
+        my_tags = ", ".join(sorted(store_product.tags)) if store_product else ""
+        my_price = _format_price(store_product) if store_product else ""
+
+        supplier_name = supplier_product.name if supplier_product else "—"
+        supplier_tags = ", ".join(sorted(supplier_product.tags)) if supplier_product else ""
+        supplier_price = _format_price(supplier_product) if supplier_product else ""
+
+        similarity = f"{row.similarity * 100:.0f}%" if row.supplier_match else "—"
+        checkbox_symbol = "☑" if self._selection.get(row.row_id) else "☐"
+
+        return (
+            my_sku,
+            my_name,
+            my_tags,
+            my_price,
+            supplier_product.supplier if supplier_product else "—",
+            supplier_name,
+            supplier_tags,
+            supplier_price,
+            similarity,
+            checkbox_symbol,
+        )
+
+    def _row_tags(self, row: ComparisonRow) -> tuple[str, ...]:
+        sku_tag = f"data-sku::{row.data_sku}" if row.data_sku else "data-sku::"
+        if row.status == "confirmed":
+            return ("match-full", "compare-checkbox", sku_tag)
+        if row.status == "flagged" or (
+            row.supplier_match and row.similarity < self.low_similarity_threshold
+        ):
+            return ("match-low", "compare-checkbox", sku_tag)
+        return ("match-none", "compare-checkbox", sku_tag)
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+    def _on_tree_click(self, event: tk.Event) -> str | None:
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return None
+        column = self.tree.identify_column(event.x)
+        if column != f"#{len(self.tree['columns'])}":
+            return None
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return "break"
+        self._toggle_checkbox(item)
+        return "break"
+
+    def _toggle_checkbox(self, item: str) -> None:
+        row_id = self._item_to_row.get(item)
+        if not row_id:
+            return
+        current = self._selection.get(row_id, False)
+        new_state = not current
+        self._selection[row_id] = new_state
+        self.tree.set(item, "checkbox", "☑" if new_state else "☐")
+
+    def _confirm_selected(self) -> None:
+        changed = False
+        for row_id, selected in list(self._selection.items()):
+            if not selected:
+                continue
+            row = self._rows.get(row_id)
+            if not row or not row.match_id:
+                continue
+            self.state_store.set_status(row.group_id, row.match_id, "confirmed")
+            self._selection[row_id] = False
+            changed = True
+        if changed:
+            self.state_store.save()
+            self.refresh()
+
+    def _remove_selected(self) -> None:
+        changed = False
+        for row_id, selected in list(self._selection.items()):
+            if not selected:
+                continue
+            row = self._rows.get(row_id)
+            if not row or not row.match_id:
+                continue
+            self.state_store.set_status(row.group_id, row.match_id, "removed")
+            self._selection.pop(row_id, None)
+            changed = True
+        if changed:
+            self.state_store.save()
+            self.refresh()
+
+    def _on_reload_clicked(self) -> None:
+        if self.on_reload:
+            self.on_reload()
+        else:
+            self.refresh()
+
+    def _focus_unconfirmed(self) -> None:
+        self._set_filter("pending")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _on_filter_selected(self, _event: tk.Event | None = None) -> None:
+        label = self.filter_label_var.get()
+        key = self._filter_label_to_key.get(label, "all")
+        self._set_filter(key)
+
+    def _on_sort_selected(self, _event: tk.Event | None = None) -> None:
+        label = self.sort_label_var.get()
+        key = self._sort_label_to_key.get(label, "name")
+        self.sort_var.set(key)
+        self.refresh()
+
+    def _on_threshold_change(self, value: str) -> None:
+        try:
+            numeric = float(value)
+        except ValueError:
+            numeric = float(self.threshold_var.get())
+        self.threshold_display_var.set(f"{numeric * 100:.0f}%")
+        self._apply_filters()
+
+    def _set_filter(self, key: str) -> None:
+        self.filter_var.set(key)
+        self.filter_label_var.set(self._label_for_filter(key))
+        self._apply_filters()
+
+    def _label_for_filter(self, key: str) -> str:
+        return next((label for option, label in self.FILTER_OPTIONS if option == key), self.FILTER_OPTIONS[0][1])
+
+    def _label_for_sort(self, key: str) -> str:
+        return next((label for option, label in self.SORT_OPTIONS if option == key), self.SORT_OPTIONS[0][1])
 
 class ImportSettingsDialog(tk.Toplevel):
     """Dialog window for configuring import column mapping."""
