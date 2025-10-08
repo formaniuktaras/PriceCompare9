@@ -64,6 +64,7 @@ class PriceListImporter:
                 "код товару",
                 "код",
                 "товарний код",
+                "vendorcode",
             },
             "name": {
                 "name",
@@ -80,7 +81,7 @@ class PriceListImporter:
                 "cost",
                 "цена",
             },
-            "currency": {"currency", "валюта"},
+            "currency": {"currency", "валюта", "currencyid"},
             "description": {"description", "опис", "описання"},
             "tags": {"tags", "теги", "мітки"},
         }
@@ -724,16 +725,50 @@ class PriceListImporter:
             raise ValueError(f"Invalid XML file '{path}': {exc}.") from exc
 
         root = tree.getroot()
-        product_elements = list(root.findall(".//product"))
-        if not product_elements and root.tag.lower() == "product":
-            product_elements = [root]
+
+        product_tags = (
+            "product",
+            "offer",
+            "item",
+            "position",
+            "record",
+            "entry",
+            "row",
+        )
+
+        product_elements: list[ET.Element] = []
+        for tag in product_tags:
+            matches = [
+                element
+                for element in root.iter()
+                if self._normalize_xml_tag(element.tag) == tag
+            ]
+            if matches:
+                product_elements = matches
+                break
+
+        if not product_elements:
+            children = list(root)
+            if children:
+                grouped: dict[str, list[ET.Element]] = {}
+                for child in children:
+                    key = self._normalize_xml_tag(child.tag)
+                    grouped.setdefault(key, []).append(child)
+                for elements in grouped.values():
+                    if len(elements) > 1:
+                        product_elements = elements
+                        break
+                if not product_elements:
+                    product_elements = children
+            elif self._normalize_xml_tag(root.tag) in product_tags:
+                product_elements = [root]
 
         products: list[dict[str, object]] = []
         for element in product_elements:
             product_data: dict[str, object] = {}
 
             for child in element:
-                key = child.tag
+                key = self._strip_xml_namespace(child.tag)
                 value = self._xml_element_to_value(child)
                 if key in product_data:
                     existing = product_data[key]
@@ -745,7 +780,7 @@ class PriceListImporter:
                     product_data[key] = value
 
             for attr, value in element.attrib.items():
-                key = str(attr)
+                key = self._strip_xml_namespace(attr)
                 if key in product_data:
                     existing = product_data[key]
                     if isinstance(existing, list):
@@ -757,9 +792,10 @@ class PriceListImporter:
 
             text = (element.text or "").strip()
             if text and not product_data:
-                product_data[element.tag] = text
+                product_data[self._strip_xml_namespace(element.tag)] = text
 
-            products.append(product_data)
+            if product_data:
+                products.append(product_data)
 
         return products
 
@@ -773,7 +809,7 @@ class PriceListImporter:
         result: dict[str, object] = {}
 
         for child in children:
-            key = child.tag
+            key = self._strip_xml_namespace(child.tag)
             value = self._xml_element_to_value(child)
             if key in result:
                 existing = result[key]
@@ -785,7 +821,7 @@ class PriceListImporter:
                 result[key] = value
 
         for attr, value in element.attrib.items():
-            key = str(attr)
+            key = self._strip_xml_namespace(attr)
             if key in result:
                 existing = result[key]
                 if isinstance(existing, list):
@@ -878,6 +914,18 @@ class PriceListImporter:
             for tag in str(value).split(";")
             if tag and tag.strip()
         }
+
+    @staticmethod
+    def _strip_xml_namespace(tag: object) -> str:
+        tag_str = str(tag)
+        if tag_str.startswith("{"):
+            _, _, remainder = tag_str[1:].partition("}")
+            tag_str = remainder or tag_str
+        return tag_str.strip()
+
+    @staticmethod
+    def _normalize_xml_tag(tag: object) -> str:
+        return PriceListImporter._strip_xml_namespace(tag).lower()
 
     def _prepare_column_mapping(
         self,
