@@ -7,10 +7,16 @@ import json
 from pathlib import Path
 from typing import Iterable, Sequence
 
+try:
+    from openpyxl import Workbook, load_workbook
+except ImportError:  # pragma: no cover - optional dependency
+    Workbook = None  # type: ignore[assignment]
+    load_workbook = None  # type: ignore[assignment]
+
 from .models import PriceList, Product
 
-SUPPORTED_IMPORT_FORMATS = {".csv", ".json"}
-SUPPORTED_EXPORT_FORMATS = {".csv", ".json"}
+SUPPORTED_IMPORT_FORMATS = {".csv", ".json", ".xlsx"}
+SUPPORTED_EXPORT_FORMATS = {".csv", ".json", ".xlsx"}
 
 
 class PriceListImporter:
@@ -27,8 +33,10 @@ class PriceListImporter:
 
         if suffix == ".csv":
             products = list(self._load_csv(path, supplier))
-        else:
+        elif suffix == ".json":
             products = list(self._load_json(path, supplier))
+        else:
+            products = list(self._load_excel(path, supplier))
 
         supplier_name = supplier or path.stem
         price_list = PriceList(supplier=supplier_name, products=products)
@@ -111,6 +119,83 @@ class PriceListImporter:
                 extra={key: value for key, value in item.get("extra", {}).items()},
             )
 
+    def _load_excel(self, path: Path, supplier: str | None) -> Iterable[Product]:
+        if load_workbook is None:
+            raise ValueError(
+                "Імпорт Excel недоступний. Встановіть залежність 'openpyxl'."
+            )
+
+        workbook = load_workbook(path, data_only=True)
+        sheet = workbook.active
+        rows = sheet.iter_rows(min_row=1, values_only=True)
+
+        try:
+            headers_row = next(rows)
+        except StopIteration:
+            return
+
+        headers = [str(value).strip() if value is not None else "" for value in headers_row]
+        normalized_headers = [header.lower() for header in headers]
+
+        required_fields = ["sku", "name", "price"]
+        missing = [field for field in required_fields if field not in normalized_headers]
+        if missing:
+            raise ValueError(
+                f"В Excel-файлі відсутні обов'язкові стовпці: {', '.join(missing)}."
+            )
+
+        for row_values in rows:
+            if not any(row_values):
+                continue
+
+            row = {
+                headers[index]: row_values[index]
+                for index in range(len(headers))
+                if headers[index]
+            }
+
+            def _get_value(*candidates: str) -> str:
+                for candidate in candidates:
+                    if candidate in row and row[candidate] is not None:
+                        return str(row[candidate]).strip()
+                return ""
+
+            sku = _get_value("sku", "SKU")
+            name = _get_value("name", "Name")
+            price_str = _get_value("price", "Price")
+            currency = _get_value("currency", "Currency") or self.default_currency
+            description_raw = row.get("description") or row.get("Description")
+            description = str(description_raw).strip() if description_raw else None
+            tags_raw = _get_value("tags", "Tags")
+
+            if not sku or not name or not price_str:
+                continue
+
+            try:
+                price = float(str(price_str).replace(",", "."))
+            except ValueError as exc:
+                raise ValueError(f"Invalid price '{price_str}' for SKU '{sku}'.") from exc
+
+            tags = {tag.strip().lower() for tag in tags_raw.split(";") if tag.strip()}
+
+            extra = {
+                key: value
+                for key, value in row.items()
+                if key not in {"sku", "SKU", "name", "Name", "price", "Price", "currency", "Currency", "description", "Description", "tags", "Tags"}
+                and value not in {None, ""}
+            }
+
+            yield Product(
+                sku=sku,
+                name=name,
+                price=price,
+                currency=currency,
+                description=description,
+                supplier=supplier,
+                tags=tags,
+                extra={k: str(v) for k, v in extra.items()},
+            )
+
 
 class PriceListExporter:
     """Export price list or product collections into supported formats."""
@@ -123,8 +208,10 @@ class PriceListExporter:
 
         if suffix == ".csv":
             self._export_csv(products, path)
-        else:
+        elif suffix == ".json":
             self._export_json(products, path)
+        else:
+            self._export_excel(products, path)
 
     def _export_csv(self, products: Sequence[Product], path: Path) -> None:
         fieldnames = ["sku", "name", "price", "currency", "description", "tags", "supplier"]
@@ -166,3 +253,34 @@ class PriceListExporter:
         }
         with path.open("w", encoding="utf-8") as fp:
             json.dump(payload, fp, indent=2, ensure_ascii=False)
+
+    def _export_excel(self, products: Sequence[Product], path: Path) -> None:
+        if Workbook is None:
+            raise ValueError(
+                "Експорт у Excel недоступний. Встановіть залежність 'openpyxl'."
+            )
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Products"
+
+        headers = ["sku", "name", "price", "currency", "description", "tags", "supplier"]
+        extra_fields = sorted({key for product in products for key in product.extra})
+        headers.extend(extra_fields)
+
+        sheet.append(headers)
+
+        for product in products:
+            row = [
+                product.sku,
+                product.name,
+                product.price,
+                product.currency,
+                product.description or "",
+                ";".join(sorted(product.tags)),
+                product.supplier or "",
+            ]
+            row.extend(product.extra.get(key, "") for key in extra_fields)
+            sheet.append(row)
+
+        workbook.save(path)

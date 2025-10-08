@@ -349,7 +349,8 @@ class PriceCompareApp(tk.Tk):
             filetypes=(
                 ("CSV файли", "*.csv"),
                 ("JSON файли", "*.json"),
-                ("Усі підтримувані", "*.csv *.json"),
+                ("Excel файли", "*.xlsx"),
+                ("Усі підтримувані", "*.csv *.json *.xlsx"),
             ),
         )
         if not path:
@@ -384,7 +385,11 @@ class PriceCompareApp(tk.Tk):
         path = filedialog.asksaveasfilename(
             title="Зберегти як",
             defaultextension=".csv",
-            filetypes=(("CSV файл", "*.csv"), ("JSON файл", "*.json")),
+            filetypes=(
+                ("CSV файл", "*.csv"),
+                ("JSON файл", "*.json"),
+                ("Excel файл", "*.xlsx"),
+            ),
         )
         if not path:
             return
