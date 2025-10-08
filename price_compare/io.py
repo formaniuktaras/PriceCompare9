@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import json
+import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -136,8 +138,13 @@ class PriceListImporter:
         path = Path(path)
         suffix = path.suffix.lower()
         if suffix == ".csv":
+            dialect, delimiter = self._detect_csv_format(path)
             with path.open("r", encoding="utf-8-sig", newline="") as fp:
-                reader = csv.reader(fp)
+                reader = (
+                    csv.reader(fp, dialect=dialect)
+                    if dialect is not None
+                    else csv.reader(fp, delimiter=delimiter)
+                )
                 try:
                     headers = next(reader)
                 except StopIteration:
@@ -189,8 +196,13 @@ class PriceListImporter:
         rows: list[dict[str, str]] = []
 
         if suffix == ".csv":
+            dialect, delimiter = self._detect_csv_format(path)
             with path.open("r", encoding="utf-8-sig", newline="") as fp:
-                reader = csv.DictReader(fp)
+                reader = (
+                    csv.DictReader(fp, dialect=dialect)
+                    if dialect is not None
+                    else csv.DictReader(fp, delimiter=delimiter)
+                )
                 headers = [
                     str(header).strip()
                     for header in (reader.fieldnames or [])
@@ -311,8 +323,13 @@ class PriceListImporter:
         supplier: str | None,
         column_mapping: dict[str, str | Sequence[str]] | None,
     ) -> Iterable[Product]:
+        dialect, delimiter = self._detect_csv_format(path)
         with path.open("r", encoding="utf-8-sig", newline="") as fp:
-            reader = csv.DictReader(fp)
+            reader = (
+                csv.DictReader(fp, dialect=dialect)
+                if dialect is not None
+                else csv.DictReader(fp, delimiter=delimiter)
+            )
             headers = reader.fieldnames or []
             mapping = self._prepare_column_mapping(headers, column_mapping, path)
             used_columns = set(mapping.values())
@@ -321,6 +338,7 @@ class PriceListImporter:
                 sku = self._extract_cell(row, mapping["sku"]).strip()
                 name = self._extract_cell(row, mapping["name"]).strip()
                 price_raw = self._extract_cell(row, mapping["price"])
+                price_str = str(price_raw).strip() if price_raw is not None else ""
 
                 currency_column = mapping.get("currency")
                 currency_value = (
@@ -337,13 +355,10 @@ class PriceListImporter:
                 tags_column = mapping.get("tags")
                 tags_raw = self._extract_cell(row, tags_column) if tags_column else ""
 
-                if not sku or not name or not price_raw:
+                if not sku or not name or not price_str:
                     continue
 
-                try:
-                    price = float(str(price_raw).replace(",", "."))
-                except ValueError as exc:
-                    raise ValueError(f"Invalid price '{price_raw}' for SKU '{sku}'.") from exc
+                price = self._parse_price(price_raw, sku)
 
                 tags = {
                     tag.strip().lower()
@@ -424,10 +439,7 @@ class PriceListImporter:
             if not sku or not name or not price_str:
                 continue
 
-            try:
-                price = float(price_str.replace(",", "."))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Invalid price '{price_raw}' for SKU '{sku}'.") from exc
+            price = self._parse_price(price_raw, sku)
 
             currency_value = _get("currency")
             currency = str(currency_value).strip() if currency_value not in {None, ""} else ""
@@ -538,10 +550,7 @@ class PriceListImporter:
             tags_column = mapping.get("tags")
             tags_raw = self._extract_cell(row, tags_column) if tags_column else ""
 
-            try:
-                price = float(str(price_str).replace(",", "."))
-            except ValueError as exc:
-                raise ValueError(f"Invalid price '{price_str}' for SKU '{sku}'.") from exc
+            price = self._parse_price(price_value, sku)
 
             tags = {
                 tag.strip().lower()
@@ -620,6 +629,85 @@ class PriceListImporter:
             )
 
         return resolved
+
+    def _detect_csv_format(self, path: Path) -> tuple[csv.Dialect | None, str]:
+        """Detect CSV dialect and delimiter, falling back to sensible defaults."""
+
+        sample = ""
+        with path.open("r", encoding="utf-8-sig", newline="") as fp:
+            sample = fp.read(4096)
+
+        dialect: csv.Dialect | None = None
+        if sample:
+            try:
+                dialect = csv.Sniffer().sniff(sample)
+            except csv.Error:
+                dialect = None
+
+        if dialect is not None:
+            delimiter = getattr(dialect, "delimiter", ",") or ","
+            return dialect, delimiter
+
+        delimiter = self._guess_delimiter(sample)
+        return None, delimiter
+
+    def _parse_price(self, price_raw: object, sku: str) -> float:
+        """Parse numeric price values from a wide range of string formats."""
+
+        if isinstance(price_raw, (int, float, Decimal)):
+            return float(price_raw)
+
+        if price_raw is None:
+            raise ValueError(f"Invalid price '{price_raw}' for SKU '{sku}'.")
+
+        price_str = str(price_raw).strip()
+        if not price_str:
+            raise ValueError(f"Invalid price '{price_raw}' for SKU '{sku}'.")
+
+        normalized = price_str.replace("\u00a0", "").replace(" ", "")
+        normalized = normalized.replace("−", "-")
+        normalized = re.sub(r"[^0-9,.-]", "", normalized)
+
+        if not normalized:
+            raise ValueError(f"Invalid price '{price_raw}' for SKU '{sku}'.")
+
+        sign = ""
+        if normalized.startswith("-"):
+            sign = "-"
+            normalized = normalized[1:]
+        normalized = normalized.replace("-", "")
+        normalized = f"{sign}{normalized}"
+
+        if not any(char.isdigit() for char in normalized):
+            raise ValueError(f"Invalid price '{price_raw}' for SKU '{sku}'.")
+
+        if "," in normalized and "." in normalized:
+            if normalized.rfind(",") > normalized.rfind("."):
+                normalized = normalized.replace(".", "")
+                normalized = normalized.replace(",", ".")
+            else:
+                normalized = normalized.replace(",", "")
+        elif "," in normalized:
+            if normalized.count(",") > 1:
+                normalized = normalized.replace(",", "")
+            else:
+                normalized = normalized.replace(",", ".")
+        elif normalized.count(".") > 1:
+            normalized = normalized.replace(".", "")
+
+        try:
+            return float(Decimal(normalized))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"Invalid price '{price_raw}' for SKU '{sku}'.") from exc
+
+    @staticmethod
+    def _guess_delimiter(sample: str) -> str:
+        candidates = [",", ";", "\t", "|"]
+        counts = {candidate: sample.count(candidate) for candidate in candidates}
+        best_candidate = max(candidates, key=lambda candidate: counts[candidate])
+        if counts[best_candidate] == 0:
+            return ","
+        return best_candidate
 
     @staticmethod
     def _extract_cell(row: dict[str, object], column: str | None) -> str:
