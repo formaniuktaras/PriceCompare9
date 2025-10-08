@@ -351,8 +351,9 @@ class PriceCompareApp(tk.Tk):
             filetypes=(
                 ("CSV файли", "*.csv"),
                 ("JSON файли", "*.json"),
+                ("XML файли", "*.xml"),
                 ("Excel файли", "*.xlsx"),
-                ("Усі підтримувані", "*.csv *.json *.xlsx"),
+                ("Усі підтримувані", "*.csv *.json *.xml *.xlsx"),
             ),
         )
         if not path:
@@ -446,6 +447,7 @@ class PriceCompareApp(tk.Tk):
             filetypes=(
                 ("CSV файл", "*.csv"),
                 ("JSON файл", "*.json"),
+                ("XML файл", "*.xml"),
                 ("Excel файл", "*.xlsx"),
             ),
         )
