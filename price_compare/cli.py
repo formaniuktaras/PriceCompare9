@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 from typing import List, Sequence
 
 from .comparator import PriceComparator
@@ -30,6 +32,14 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser = subparsers.add_parser("import", help="Import a price list")
     import_parser.add_argument("supplier", help="Supplier name")
     import_parser.add_argument("path", help="Path to CSV or JSON price list")
+    import_parser.add_argument(
+        "--mapping",
+        default=None,
+        help=(
+            "Optional column mapping as JSON string or path to a JSON file. "
+            "Example: '{\"sku\": [\"код товару\", \"артикул\"], \"price\": \"вартість\"}'"
+        ),
+    )
 
     subparsers.add_parser("suppliers", help="List registered suppliers")
 
@@ -77,11 +87,55 @@ def _make_tagger(tags_config: str | None) -> Tagger:
     return Tagger()
 
 
+def _load_column_mapping_arg(
+    mapping_argument: str | None,
+) -> dict[str, str | Sequence[str]] | None:
+    if not mapping_argument:
+        return None
+
+    try:
+        payload = json.loads(mapping_argument)
+    except json.JSONDecodeError:
+        path = Path(mapping_argument)
+        with path.open("r", encoding="utf-8") as fp:
+            payload = json.load(fp)
+
+    if not isinstance(payload, dict):
+        raise ValueError("Column mapping must be a JSON object with field definitions.")
+
+    allowed_fields = {"sku", "name", "price", "currency", "description", "tags"}
+    mapping: dict[str, str | Sequence[str]] = {}
+    for key, value in payload.items():
+        field = str(key).strip().lower()
+        if field not in allowed_fields:
+            raise ValueError(
+                f"Unsupported column mapping key '{key}'. Allowed keys: {sorted(allowed_fields)}."
+            )
+
+        if isinstance(value, str):
+            mapping[field] = value
+        elif isinstance(value, (list, tuple, set)):
+            mapping[field] = [str(item) for item in value]
+        else:
+            raise ValueError(
+                f"Mapping for '{field}' must be a string or list of strings, got {type(value).__name__}."
+            )
+
+    return mapping or None
+
+
 def cmd_import(args: argparse.Namespace) -> None:
     repository = PriceListRepository(args.data_dir)
     importer = PriceListImporter()
+    try:
+        column_mapping = _load_column_mapping_arg(args.mapping)
+    except (OSError, ValueError) as exc:
+        print(f"Failed to load column mapping: {exc}")
+        return
     tagger = _make_tagger(args.tags_config)
-    price_list = importer.load(args.path, supplier=args.supplier)
+    price_list = importer.load(
+        args.path, supplier=args.supplier, column_mapping=column_mapping
+    )
     tagger.apply(price_list.products)
     repository.save(price_list)
     print(f"Imported {len(price_list.products)} products for supplier '{price_list.supplier}'.")
