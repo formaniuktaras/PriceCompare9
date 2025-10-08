@@ -32,7 +32,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     import_parser = subparsers.add_parser("import", help="Import a price list")
     import_parser.add_argument("supplier", help="Supplier name")
-    import_parser.add_argument("path", help="Path to CSV or JSON price list")
+    import_parser.add_argument(
+        "path", help="Path to a CSV, JSON, XML or Excel price list"
+    )
     import_parser.add_argument(
         "--mapping",
         default=None,
@@ -67,7 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     export_parser = subparsers.add_parser("export", help="Export search results to a file")
     export_parser.add_argument("query", help="Query to search for")
-    export_parser.add_argument("output", help="Output file path (CSV or JSON)")
+    export_parser.add_argument(
+        "output", help="Output file path (CSV, JSON, XML or Excel)"
+    )
     export_parser.add_argument("--supplier", help="Restrict to supplier", default=None)
     export_parser.add_argument("--fuzzy", action="store_true", help="Use fuzzy search")
     export_parser.add_argument("--threshold", type=float, default=0.65, help="Fuzzy threshold")

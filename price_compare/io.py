@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import xml.etree.ElementTree as ET
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -40,8 +41,8 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from .models import PriceList, Product
 
-SUPPORTED_IMPORT_FORMATS = {".csv", ".json", ".xlsx"}
-SUPPORTED_EXPORT_FORMATS = {".csv", ".json", ".xlsx"}
+SUPPORTED_IMPORT_FORMATS = {".csv", ".json", ".xlsx", ".xml"}
+SUPPORTED_EXPORT_FORMATS = {".csv", ".json", ".xlsx", ".xml"}
 
 
 class PriceListImporter:
@@ -116,6 +117,8 @@ class PriceListImporter:
             products = list(self._load_csv(path, supplier, column_mapping))
         elif suffix == ".json":
             products = list(self._load_json(path, supplier, column_mapping))
+        elif suffix == ".xml":
+            products = list(self._load_xml(path, supplier, column_mapping))
         else:
             products = list(self._load_excel(path, supplier, column_mapping))
 
@@ -157,6 +160,18 @@ class PriceListImporter:
             products_data = payload.get("products") if isinstance(payload, dict) else None
             if not isinstance(products_data, list):
                 return []
+            headers: list[str] = []
+            for item in products_data:
+                if not isinstance(item, dict):
+                    continue
+                for key in item.keys():
+                    key_str = str(key)
+                    if key_str not in headers:
+                        headers.append(key_str)
+            return headers
+
+        if suffix == ".xml":
+            products_data = self._parse_xml_products(path)
             headers: list[str] = []
             for item in products_data:
                 if not isinstance(item, dict):
@@ -235,6 +250,28 @@ class PriceListImporter:
                     if not isinstance(item, dict):
                         continue
                     rows.append({header: str(item.get(header, "")) for header in headers})
+            return headers, rows
+
+        if suffix == ".xml":
+            products_data = self._parse_xml_products(path)
+            for item in products_data:
+                if not isinstance(item, dict):
+                    continue
+                for key in item.keys():
+                    key_str = str(key)
+                    if key_str not in headers:
+                        headers.append(key_str)
+            if limit == 0:
+                return headers, rows
+            for item in products_data[: limit or None]:
+                if not isinstance(item, dict):
+                    continue
+                rows.append(
+                    {
+                        header: self._stringify_xml_value(item.get(header, ""))
+                        for header in headers
+                    }
+                )
             return headers, rows
 
         if suffix == ".xlsx":
@@ -496,6 +533,111 @@ class PriceListImporter:
                 extra=extra,
             )
 
+    def _load_xml(
+        self,
+        path: Path,
+        supplier: str | None,
+        column_mapping: dict[str, str | Sequence[str]] | None,
+    ) -> Iterable[Product]:
+        products_data = self._parse_xml_products(path)
+
+        header_index: dict[str, str] = {}
+        for item in products_data:
+            if isinstance(item, dict):
+                for key in item.keys():
+                    key_str = str(key)
+                    normalized = key_str.strip().lower()
+                    header_index.setdefault(normalized, key_str)
+
+        if not header_index and not products_data:
+            return
+
+        mapping = self._prepare_column_mapping(
+            list(header_index.values()), column_mapping, path
+        )
+        used_columns = set(mapping.values())
+
+        for item in products_data:
+            if not isinstance(item, dict):
+                continue
+
+            normalized_row = {
+                str(key).strip().lower(): value for key, value in item.items()
+            }
+
+            def _get(field: str) -> object | None:
+                column = mapping.get(field)
+                if not column:
+                    return None
+                if column in item and item[column] is not None:
+                    return item[column]
+                column_lower = column.strip().lower()
+                if (
+                    column_lower in normalized_row
+                    and normalized_row[column_lower] is not None
+                ):
+                    return normalized_row[column_lower]
+                return None
+
+            sku = str(self._extract_first_xml_value(_get("sku")) or "").strip()
+            name = str(self._extract_first_xml_value(_get("name")) or "").strip()
+            price_raw = self._extract_first_xml_value(_get("price"))
+            price_str = str(price_raw).strip() if price_raw is not None else ""
+
+            if not sku or not name or not price_str:
+                continue
+
+            price = self._parse_price(price_raw, sku)
+
+            currency_value = self._extract_first_xml_value(_get("currency"))
+            currency = (
+                str(currency_value).strip()
+                if currency_value not in {None, ""}
+                else ""
+            )
+            currency = currency or self.default_currency
+
+            description_value = self._extract_first_xml_value(_get("description"))
+            if isinstance(description_value, str):
+                description = description_value.strip() or None
+            elif description_value is None:
+                description = None
+            else:
+                description = str(description_value)
+
+            tags_value = _get("tags")
+            tags = self._extract_tags_from_xml(tags_value)
+            if not tags and isinstance(item.get("tags"), dict):
+                tags = self._extract_tags_from_xml(item.get("tags"))
+
+            extra: dict[str, str] = {}
+            for key, value in item.items():
+                if key in used_columns or key == "extra":
+                    continue
+                stringified = self._stringify_xml_value(value)
+                if stringified:
+                    extra[str(key)] = stringified
+
+            extra_payload = item.get("extra")
+            if isinstance(extra_payload, dict):
+                for key, value in extra_payload.items():
+                    if key in used_columns:
+                        continue
+                    stringified = self._stringify_xml_value(value)
+                    if stringified:
+                        extra[str(key)] = stringified
+
+            yield Product(
+                sku=sku,
+                name=name,
+                price=price,
+                currency=currency,
+                description=description,
+                supplier=supplier,
+                tags=tags,
+                extra=extra,
+            )
+
     def _load_excel(
         self,
         path: Path,
@@ -574,6 +716,168 @@ class PriceListImporter:
                 tags=tags,
                 extra={k: str(v) for k, v in extra.items()},
             )
+
+    def _parse_xml_products(self, path: Path) -> list[dict[str, object]]:
+        try:
+            tree = ET.parse(path)
+        except ET.ParseError as exc:  # pragma: no cover - invalid input
+            raise ValueError(f"Invalid XML file '{path}': {exc}.") from exc
+
+        root = tree.getroot()
+        product_elements = list(root.findall(".//product"))
+        if not product_elements and root.tag.lower() == "product":
+            product_elements = [root]
+
+        products: list[dict[str, object]] = []
+        for element in product_elements:
+            product_data: dict[str, object] = {}
+
+            for child in element:
+                key = child.tag
+                value = self._xml_element_to_value(child)
+                if key in product_data:
+                    existing = product_data[key]
+                    if isinstance(existing, list):
+                        existing.append(value)
+                    else:
+                        product_data[key] = [existing, value]
+                else:
+                    product_data[key] = value
+
+            for attr, value in element.attrib.items():
+                key = str(attr)
+                if key in product_data:
+                    existing = product_data[key]
+                    if isinstance(existing, list):
+                        existing.append(value)
+                    else:
+                        product_data[key] = [existing, value]
+                else:
+                    product_data[key] = value
+
+            text = (element.text or "").strip()
+            if text and not product_data:
+                product_data[element.tag] = text
+
+            products.append(product_data)
+
+        return products
+
+    def _xml_element_to_value(self, element: ET.Element) -> object:
+        children = list(element)
+        text = (element.text or "").strip()
+
+        if not children and not element.attrib:
+            return text
+
+        result: dict[str, object] = {}
+
+        for child in children:
+            key = child.tag
+            value = self._xml_element_to_value(child)
+            if key in result:
+                existing = result[key]
+                if isinstance(existing, list):
+                    existing.append(value)
+                else:
+                    result[key] = [existing, value]
+            else:
+                result[key] = value
+
+        for attr, value in element.attrib.items():
+            key = str(attr)
+            if key in result:
+                existing = result[key]
+                if isinstance(existing, list):
+                    existing.append(value)
+                else:
+                    result[key] = [existing, value]
+            else:
+                result[key] = value
+
+        if text:
+            result.setdefault("_text", text)
+
+        return result
+
+    @staticmethod
+    def _extract_first_xml_value(value: object | None) -> object | None:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            if "_text" in value and value["_text"] not in {None, ""}:
+                return value["_text"]
+            for key, nested in value.items():
+                if key == "_text":
+                    continue
+                extracted = PriceListImporter._extract_first_xml_value(nested)
+                if extracted not in {None, ""}:
+                    return extracted
+            return None
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                extracted = PriceListImporter._extract_first_xml_value(item)
+                if extracted not in {None, ""}:
+                    return extracted
+            return None
+        return value
+
+    @staticmethod
+    def _stringify_xml_value(value: object | None) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, dict):
+            parts: list[str] = []
+            text = value.get("_text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+            for key, nested in value.items():
+                if key == "_text":
+                    continue
+                nested_str = PriceListImporter._stringify_xml_value(nested)
+                if nested_str:
+                    parts.append(f"{key}:{nested_str}")
+            return "; ".join(parts)
+        if isinstance(value, (list, tuple, set)):
+            return "; ".join(
+                filter(
+                    None,
+                    (
+                        PriceListImporter._stringify_xml_value(item)
+                        for item in value
+                    ),
+                )
+            )
+        return str(value)
+
+    @staticmethod
+    def _extract_tags_from_xml(value: object | None) -> set[str]:
+        if value is None:
+            return set()
+        if isinstance(value, dict):
+            tags: set[str] = set()
+            text = value.get("_text")
+            if isinstance(text, str):
+                tags.update(
+                    tag.strip().lower()
+                    for tag in text.split(";")
+                    if tag and tag.strip()
+                )
+            for key, nested in value.items():
+                if key == "_text":
+                    continue
+                tags.update(PriceListImporter._extract_tags_from_xml(nested))
+            return tags
+        if isinstance(value, (list, tuple, set)):
+            tags: set[str] = set()
+            for item in value:
+                tags.update(PriceListImporter._extract_tags_from_xml(item))
+            return tags
+        return {
+            tag.strip().lower()
+            for tag in str(value).split(";")
+            if tag and tag.strip()
+        }
 
     def _prepare_column_mapping(
         self,
@@ -735,6 +1039,8 @@ class PriceListExporter:
             self._export_csv(products, path)
         elif suffix == ".json":
             self._export_json(products, path)
+        elif suffix == ".xml":
+            self._export_xml(products, path)
         else:
             self._export_excel(products, path)
 
@@ -809,3 +1115,42 @@ class PriceListExporter:
             sheet.append(row)
 
         workbook.save(path)
+
+    def _export_xml(self, products: Sequence[Product], path: Path) -> None:
+        root = ET.Element("products")
+        for product in products:
+            product_elem = ET.SubElement(root, "product")
+            ET.SubElement(product_elem, "sku").text = product.sku
+            ET.SubElement(product_elem, "name").text = product.name
+            ET.SubElement(product_elem, "price").text = str(product.price)
+            ET.SubElement(product_elem, "currency").text = product.currency
+            if product.description:
+                ET.SubElement(product_elem, "description").text = product.description
+            if product.tags:
+                tags_elem = ET.SubElement(product_elem, "tags")
+                for tag in sorted(product.tags):
+                    ET.SubElement(tags_elem, "tag").text = tag
+            if product.supplier:
+                ET.SubElement(product_elem, "supplier").text = product.supplier
+            if product.extra:
+                extra_elem = ET.SubElement(product_elem, "extra")
+                for key in sorted(product.extra):
+                    value = product.extra[key]
+                    ET.SubElement(extra_elem, key).text = str(value)
+
+        self._indent_xml(root)
+        tree = ET.ElementTree(root)
+        tree.write(path, encoding="utf-8", xml_declaration=True)
+
+    def _indent_xml(self, element: ET.Element, level: int = 0) -> None:
+        indent = "\n" + "  " * level
+        if len(element):
+            if not element.text or not element.text.strip():
+                element.text = indent + "  "
+            for child in element:
+                self._indent_xml(child, level + 1)
+            if not element.tail or not element.tail.strip():
+                element.tail = indent
+        else:
+            if level and (not element.tail or not element.tail.strip()):
+                element.tail = indent
