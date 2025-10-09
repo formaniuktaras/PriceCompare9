@@ -5,11 +5,12 @@ from __future__ import annotations
 import ast
 import json
 import re
+import threading
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, TypeVar
 
 from .comparison_engine import ComparisonBuilder, ComparisonGroup, SupplierMatch
 from .comparison_state import ComparisonStateStore
@@ -28,6 +29,58 @@ def _format_price(product: Product) -> str:
 
 STORE_PRICE_FILENAME = "store_price.json"
 STORE_SUPPLIER_NAME = "Мій інтернет-магазин"
+
+
+T = TypeVar("T")
+
+
+def _center_dialog(window: tk.Toplevel, master: tk.Misc) -> str:
+    master.update_idletasks()
+    window.update_idletasks()
+    width = window.winfo_width()
+    height = window.winfo_height()
+    master_width = master.winfo_width() or window.winfo_width()
+    master_height = master.winfo_height() or window.winfo_height()
+    x = master.winfo_rootx() + max((master_width - width) // 2, 0)
+    y = master.winfo_rooty() + max((master_height - height) // 2, 0)
+    return f"+{x}+{y}"
+
+
+class ProgressDialog(tk.Toplevel):
+    """Modal dialog that shows an indeterminate progress bar."""
+
+    def __init__(self, master: tk.Misc, *, title: str, message: str) -> None:
+        super().__init__(master)
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        container = ttk.Frame(self, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(container, text=message, wraplength=320, justify=tk.LEFT).pack(
+            fill=tk.X
+        )
+        self.progress = ttk.Progressbar(container, mode="indeterminate", length=320)
+        self.progress.pack(fill=tk.X, pady=(12, 0))
+        self.progress.start(12)
+
+        self.update_idletasks()
+        if master.winfo_viewable():
+            self.geometry(_center_dialog(self, master))
+
+    def close(self) -> None:
+        try:
+            self.progress.stop()
+        except tk.TclError:
+            pass
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
 
 
 class PriceCompareApp(tk.Tk):
@@ -58,10 +111,12 @@ class PriceCompareApp(tk.Tk):
         self.price_lists: Dict[str, PriceList] = {}
         self.store_price_list: PriceList | None = None
         self._store_price_path = self.repository.data_dir / STORE_PRICE_FILENAME
+        self._comparison_refresh_in_progress = False
+        self._catalog_links_button: ttk.Button | None = None
 
         self._create_menu()
         self._create_widgets()
-        self.refresh_data()
+        self.refresh_data(mark_comparisons_stale=False)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -87,6 +142,54 @@ class PriceCompareApp(tk.Tk):
         self._build_search_tab()
         self._build_tags_tab()
         self._build_compare_tab()
+
+    def _set_links_button_state(self, enabled: bool) -> None:
+        if self._catalog_links_button is None:
+            return
+        state = tk.NORMAL if enabled else tk.DISABLED
+        self._catalog_links_button.config(state=state)
+
+    def _mark_comparisons_stale(self) -> None:
+        if hasattr(self, "comparison_board"):
+            self.comparison_board.mark_stale()
+        if not self._comparison_refresh_in_progress:
+            self._set_links_button_state(bool(self.price_lists or self.store_price_list))
+
+    def _run_background_task(
+        self,
+        *,
+        title: str,
+        message: str,
+        task: Callable[[], T],
+        on_success: Callable[[T], None] | None = None,
+        on_error: Callable[[Exception], None] | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        dialog = ProgressDialog(self, title=title, message=message)
+
+        def handle_success(result: T) -> None:
+            dialog.close()
+            if on_success:
+                on_success(result)
+
+        def handle_error(exc: Exception) -> None:
+            dialog.close()
+            if on_error:
+                on_error(exc)
+            else:
+                details = error_message or "Сталася помилка під час виконання операції."
+                messagebox.showerror(title, f"{details}\n\n{exc}")
+
+        def worker() -> None:
+            try:
+                result = task()
+            except Exception as exc:  # pragma: no cover - background thread
+                self.after(0, lambda: handle_error(exc))
+            else:
+                self.after(0, lambda: handle_success(result))
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
 
     def _create_menu(self) -> None:
         menubar = tk.Menu(self)
@@ -148,9 +251,15 @@ class PriceCompareApp(tk.Tk):
         ttk.Button(toolbar, text="Видалити", command=self._delete_supplier).pack(
             side=tk.LEFT, padx=(8, 0)
         )
-        ttk.Button(toolbar, text="Оновити", command=self.refresh_data).pack(
+        ttk.Button(toolbar, text="Оновити дані", command=self.refresh_data).pack(
             side=tk.LEFT, padx=(8, 0)
         )
+        self._catalog_links_button = ttk.Button(
+            toolbar,
+            text="Оновити зв'язки",
+            command=self._start_comparison_refresh,
+        )
+        self._catalog_links_button.pack(side=tk.LEFT, padx=(8, 0))
 
         body = ttk.Panedwindow(self.catalog_tab, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
@@ -270,14 +379,55 @@ class PriceCompareApp(tk.Tk):
             get_store_products=self._current_store_products,
             get_supplier_lists=lambda: list(self.price_lists.values()),
             state_store=self.comparison_state,
-            on_reload=self.refresh_data,
+            on_reload=self._start_comparison_refresh,
         )
         self.comparison_board.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
     # ------------------------------------------------------------------
     # Data helpers
     # ------------------------------------------------------------------
-    def refresh_data(self) -> None:
+    def _start_comparison_refresh(self) -> None:
+        if not hasattr(self, "comparison_board"):
+            return
+        if self._comparison_refresh_in_progress:
+            return
+
+        if not self.price_lists and not self.store_price_list:
+            messagebox.showinfo(
+                "Оновлення зв'язків",
+                "Спочатку імпортуйте принаймні один прайс або завантажте прайс магазину.",
+            )
+            return
+
+        self._comparison_refresh_in_progress = True
+        self._set_links_button_state(False)
+        self.comparison_board.set_busy(True)
+
+        def on_success(rows: Sequence[ComparisonRow]) -> None:
+            self._comparison_refresh_in_progress = False
+            self.comparison_board.refresh(rows=rows)
+            self.comparison_board.set_busy(False)
+            self._set_links_button_state(bool(self.price_lists or self.store_price_list))
+
+        def on_error(exc: Exception) -> None:
+            self._comparison_refresh_in_progress = False
+            self.comparison_board.set_busy(False)
+            self.comparison_board.mark_stale()
+            self._set_links_button_state(bool(self.price_lists or self.store_price_list))
+            messagebox.showerror(
+                "Оновлення зв'язків",
+                f"Не вдалося оновити співставлення: {exc}",
+            )
+
+        self._run_background_task(
+            title="Оновлення зв'язків",
+            message="Будь ласка, зачекайте. Виконується оновлення співставлень прайсів…",
+            task=self.comparison_board.build_rows,
+            on_success=on_success,
+            on_error=on_error,
+        )
+
+    def refresh_data(self, *, mark_comparisons_stale: bool = True) -> None:
         try:
             self.price_lists = self.repository.load_all()
         except Exception as exc:
@@ -288,10 +438,16 @@ class PriceCompareApp(tk.Tk):
         self._show_supplier_products()
         self._load_store_price_from_disk()
         self._update_store_tree()
+        has_any_prices = bool(self.price_lists or self.store_price_list)
+        if not self._comparison_refresh_in_progress:
+            self._set_links_button_state(has_any_prices)
+        if mark_comparisons_stale:
+            self._mark_comparisons_stale()
         if hasattr(self, "tags_board"):
             self.tags_board.refresh_products()
         if hasattr(self, "comparison_board"):
-            self.comparison_board.refresh()
+            if not mark_comparisons_stale:
+                self.comparison_board.refresh()
 
     def _populate_suppliers(self) -> None:
         self.suppliers_list.delete(0, tk.END)
@@ -397,30 +553,42 @@ class PriceCompareApp(tk.Tk):
         column_mapping = dialog.result["column_mapping"]
         save_template = dialog.result["save_template"]
 
-        try:
+        def task() -> PriceList:
             price_list = self.importer.load(
                 path, supplier=supplier, column_mapping=column_mapping
             )
-        except MissingRequiredColumnsError as exc:
-            messagebox.showerror(
-                "Помилка імпорту",
-                "Не вдалося знайти обов'язкові колонки: {}.\nДоступні заголовки: {}.".format(
-                    ", ".join(exc.missing), ", ".join(exc.headers)
-                ),
+            self.tagger.apply(price_list.products)
+            self.repository.save(price_list)
+            if save_template:
+                self.template_store.save_template(supplier, column_mapping, headers)
+            return price_list
+
+        def on_success(price_list: PriceList) -> None:
+            messagebox.showinfo(
+                "Готово", f"Імпортовано {len(price_list.products)} позицій."
             )
-            return
-        except Exception as exc:
-            messagebox.showerror("Помилка імпорту", f"Не вдалося імпортувати прайс: {exc}")
-            return
+            self.refresh_data()
 
-        self.tagger.apply(price_list.products)
-        self.repository.save(price_list)
+        def on_error(exc: Exception) -> None:
+            if isinstance(exc, MissingRequiredColumnsError):
+                messagebox.showerror(
+                    "Помилка імпорту",
+                    "Не вдалося знайти обов'язкові колонки: {}.\nДоступні заголовки: {}.".format(
+                        ", ".join(exc.missing), ", ".join(exc.headers)
+                    ),
+                )
+            else:
+                messagebox.showerror(
+                    "Помилка імпорту", f"Не вдалося імпортувати прайс: {exc}"
+                )
 
-        if save_template:
-            self.template_store.save_template(supplier, column_mapping, headers)
-
-        messagebox.showinfo("Готово", f"Імпортовано {len(price_list.products)} позицій.")
-        self.refresh_data()
+        self._run_background_task(
+            title="Імпорт прайсу",
+            message="Будь ласка, зачекайте. Триває імпорт прайс-листа…",
+            task=task,
+            on_success=on_success,
+            on_error=on_error,
+        )
 
     def _export_supplier(self) -> None:
         supplier = self._selected_supplier()
@@ -616,41 +784,53 @@ class PriceCompareApp(tk.Tk):
         column_mapping = dialog.result["column_mapping"]
         save_template = dialog.result["save_template"]
 
-        try:
+        def task() -> PriceList:
             price_list = self.importer.load(
                 path, supplier=supplier, column_mapping=column_mapping
             )
-        except MissingRequiredColumnsError as exc:
-            messagebox.showerror(
-                "Помилка імпорту",
-                "Не вдалося знайти обов'язкові колонки: {}.\nДоступні заголовки: {}.".format(
-                    ", ".join(exc.missing), ", ".join(exc.headers)
-                ),
+            self.tagger.apply(price_list.products)
+            return price_list
+
+        def on_success(price_list: PriceList) -> None:
+            self.store_price_list = price_list
+            try:
+                self._save_store_price(price_list)
+            except Exception as exc:
+                messagebox.showerror(
+                    "Помилка", f"Не вдалося зберегти прайс магазину: {exc}"
+                )
+                return
+
+            if save_template:
+                self.template_store.save_template(supplier, column_mapping, headers)
+
+            messagebox.showinfo(
+                "Готово",
+                f"Завантажено {len(price_list.products)} позицій прайсу магазину.",
             )
-            return
-        except Exception as exc:
-            messagebox.showerror("Помилка імпорту", f"Не вдалося імпортувати прайс: {exc}")
-            return
+            self._update_store_tree()
+            self._mark_comparisons_stale()
 
-        self.tagger.apply(price_list.products)
-        self.store_price_list = price_list
+        def on_error(exc: Exception) -> None:
+            if isinstance(exc, MissingRequiredColumnsError):
+                messagebox.showerror(
+                    "Помилка імпорту",
+                    "Не вдалося знайти обов'язкові колонки: {}.\nДоступні заголовки: {}.".format(
+                        ", ".join(exc.missing), ", ".join(exc.headers)
+                    ),
+                )
+            else:
+                messagebox.showerror(
+                    "Помилка імпорту", f"Не вдалося імпортувати прайс: {exc}"
+                )
 
-        try:
-            self._save_store_price(price_list)
-        except Exception as exc:
-            messagebox.showerror("Помилка", f"Не вдалося зберегти прайс магазину: {exc}")
-            return
-
-        if save_template:
-            self.template_store.save_template(supplier, column_mapping, headers)
-
-        messagebox.showinfo(
-            "Готово",
-            f"Завантажено {len(price_list.products)} позицій прайсу магазину.",
+        self._run_background_task(
+            title="Прайс магазину",
+            message="Будь ласка, зачекайте. Триває оновлення прайсу магазину…",
+            task=task,
+            on_success=on_success,
+            on_error=on_error,
         )
-        self._update_store_tree()
-        if hasattr(self, "comparison_board"):
-            self.comparison_board.refresh()
 
     def _load_store_price_from_disk(self) -> None:
         if not self._store_price_path.exists():
@@ -784,7 +964,8 @@ class PriceCompareApp(tk.Tk):
         self._update_store_tree()
         self._show_supplier_products()
         if hasattr(self, "comparison_board"):
-            self.comparison_board.refresh()
+            self.comparison_board.refresh_view()
+        self._mark_comparisons_stale()
 
 
 class JsonEditorDialog(tk.Toplevel):
@@ -1792,6 +1973,10 @@ class ComparisonBoard(ttk.Frame):
         self.filter_label_var = tk.StringVar(value=self._label_for_filter("all"))
         self.sort_label_var = tk.StringVar(value=self._label_for_sort("name"))
         self.threshold_display_var = tk.StringVar(value="60%")
+        self.status_var = tk.StringVar(value="")
+        self._busy = False
+        self._stale = False
+        self._action_buttons: List[ttk.Button] = []
 
         self._build_ui()
         self.refresh()
@@ -1799,12 +1984,72 @@ class ComparisonBoard(ttk.Frame):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def refresh(self) -> None:
+    def refresh(self, rows: Sequence[ComparisonRow] | None = None) -> None:
         previous_selection = {row_id for row_id, selected in self._selection.items() if selected}
-        self._ordered_rows = self._rebuild_rows()
+        computed_rows = list(rows) if rows is not None else self._rebuild_rows()
+        self._ordered_rows = computed_rows
         self._rows = {row.row_id: row for row in self._ordered_rows}
         self._selection = {row.row_id: (row.row_id in previous_selection) for row in self._ordered_rows}
         self._apply_filters()
+        self.clear_stale()
+
+    def refresh_view(self) -> None:
+        self._apply_filters()
+
+    def build_rows(self) -> List[ComparisonRow]:
+        return self._rebuild_rows()
+
+    def mark_stale(self) -> None:
+        self._stale = True
+        self._update_status_message()
+
+    def clear_stale(self) -> None:
+        self._stale = False
+        self._update_status_message()
+
+    def set_busy(self, busy: bool) -> None:
+        if self._busy == busy:
+            self._update_status_message()
+            return
+        self._busy = busy
+        state = tk.DISABLED if busy else tk.NORMAL
+        for button in self._action_buttons:
+            button.config(state=state)
+        try:
+            if busy:
+                self.tree.state(["disabled"])
+            else:
+                self.tree.state(["!disabled"])
+        except tk.TclError:
+            pass
+        self._update_status_message()
+
+    def _set_status(self, message: str, *, severity: str = "info") -> None:
+        colors = {
+            "info": "#1a3d7c",
+            "warning": "#a15c13",
+            "error": "#a94442",
+        }
+        if message:
+            self.status_var.set(message)
+            self.status_label.configure(foreground=colors.get(severity, "#1a3d7c"))
+            if not self.status_label.winfo_ismapped():
+                self.status_label.pack(fill=tk.X, padx=8, pady=(0, 4))
+        else:
+            self.status_var.set("")
+            if self.status_label.winfo_ismapped():
+                self.status_label.pack_forget()
+
+    def _update_status_message(self) -> None:
+        if self._busy:
+            self._set_status("Виконується оновлення співставлень…", severity="info")
+        elif self._stale:
+            self._set_status(
+                "Дані співставлення застаріли. Натисніть «Оновити зв'язки».",
+                severity="warning",
+            )
+        else:
+            self._set_status("")
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1859,18 +2104,34 @@ class ComparisonBoard(ttk.Frame):
 
         actions = ttk.Frame(self)
         actions.pack(fill=tk.X, padx=8, pady=(0, 6))
-        ttk.Button(actions, text="Підтвердити вибрані аналоги", command=self._confirm_selected).pack(
-            side=tk.LEFT
+        self.confirm_button = ttk.Button(
+            actions, text="Підтвердити вибрані аналоги", command=self._confirm_selected
         )
-        ttk.Button(actions, text="Видалити вибрані", command=self._remove_selected).pack(
-            side=tk.LEFT, padx=(8, 0)
+        self.confirm_button.pack(side=tk.LEFT)
+        self.remove_button = ttk.Button(
+            actions, text="Видалити вибрані", command=self._remove_selected
         )
-        ttk.Button(actions, text="Оновити результати", command=self._on_reload_clicked).pack(
-            side=tk.LEFT, padx=(8, 0)
+        self.remove_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.reload_button = ttk.Button(
+            actions, text="Оновити результати", command=self._on_reload_clicked
         )
-        ttk.Button(actions, text="Показати тільки непідтверджені", command=self._focus_unconfirmed).pack(
-            side=tk.LEFT, padx=(8, 0)
+        self.reload_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.focus_button = ttk.Button(
+            actions,
+            text="Показати тільки непідтверджені",
+            command=self._focus_unconfirmed,
         )
+        self.focus_button.pack(side=tk.LEFT, padx=(8, 0))
+        self._action_buttons = [
+            self.confirm_button,
+            self.remove_button,
+            self.reload_button,
+            self.focus_button,
+        ]
+
+        self.status_label = ttk.Label(self, textvariable=self.status_var, anchor=tk.W)
+        self.status_label.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self.status_label.pack_forget()
 
         table_frame = ttk.Frame(self)
         table_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
