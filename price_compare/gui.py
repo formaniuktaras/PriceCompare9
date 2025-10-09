@@ -7,7 +7,7 @@ import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set
 
 from .comparison_engine import ComparisonBuilder, ComparisonGroup, SupplierMatch
 from .comparison_state import ComparisonStateStore
@@ -16,6 +16,7 @@ from .models import PriceList, Product
 from .repository import PriceListRepository
 from .search import ProductSearch
 from .tagging import Tagger
+from . import tags_assignment
 from .templates import ImportTemplate, ImportTemplateStore
 
 
@@ -70,16 +71,19 @@ class PriceCompareApp(tk.Tk):
         self.main_price_tab = ttk.Frame(container)
         self.catalog_tab = ttk.Frame(container)
         self.search_tab = ttk.Frame(container)
+        self.tags_tab = ttk.Frame(container)
         self.compare_tab = ttk.Frame(container)
 
         container.add(self.main_price_tab, text="Основний прайс")
         container.add(self.catalog_tab, text="Каталог постачальників")
         container.add(self.search_tab, text="Пошук")
+        container.add(self.tags_tab, text="Мітки")
         container.add(self.compare_tab, text="Порівняння")
 
         self._build_main_price_tab()
         self._build_catalog_tab()
         self._build_search_tab()
+        self._build_tags_tab()
         self._build_compare_tab()
 
     def _create_menu(self) -> None:
@@ -249,6 +253,15 @@ class PriceCompareApp(tk.Tk):
 
         self.search_results: List[Product] = []
 
+    def _build_tags_tab(self) -> None:
+        self.tags_board = TagsTab(
+            self.tags_tab,
+            data_dir=self.repository.data_dir,
+            get_products=self._all_products_for_tags,
+            on_save=self._on_tags_saved,
+        )
+        self.tags_board.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
     def _build_compare_tab(self) -> None:
         self.comparison_board = ComparisonBoard(
             self.compare_tab,
@@ -273,6 +286,8 @@ class PriceCompareApp(tk.Tk):
         self._show_supplier_products()
         self._load_store_price_from_disk()
         self._update_store_tree()
+        if hasattr(self, "tags_board"):
+            self.tags_board.refresh_products()
         if hasattr(self, "comparison_board"):
             self.comparison_board.refresh()
 
@@ -727,6 +742,620 @@ class PriceCompareApp(tk.Tk):
             return []
         return list(self.store_price_list.products)
 
+    def _all_products_for_tags(self) -> List[Product]:
+        products: List[Product] = []
+        if self.store_price_list:
+            products.extend(self.store_price_list.products)
+        for price_list in self.price_lists.values():
+            products.extend(price_list.products)
+        return products
+
+    def _on_tags_saved(self, assignments: Sequence[tags_assignment.TagAssignment]) -> None:
+        suppliers_to_save: Dict[str, PriceList] = {}
+        for assignment in assignments:
+            product = assignment.product
+            final_tags = assignment.all_effective_tags()
+            product.tags = set(final_tags)
+            supplier = product.supplier or STORE_SUPPLIER_NAME
+            if self.store_price_list and supplier == self.store_price_list.supplier:
+                suppliers_to_save[supplier] = self.store_price_list
+            elif supplier in self.price_lists:
+                suppliers_to_save[supplier] = self.price_lists[supplier]
+
+        if self.store_price_list and self.store_price_list.supplier in suppliers_to_save:
+            try:
+                self._save_store_price(self.store_price_list)
+            except Exception as exc:
+                messagebox.showerror("Збереження тегів", f"Не вдалося оновити мітки магазину: {exc}")
+
+        for supplier, price_list in suppliers_to_save.items():
+            if self.store_price_list and supplier == self.store_price_list.supplier:
+                continue
+            try:
+                self.repository.save(price_list)
+            except Exception as exc:
+                messagebox.showerror(
+                    "Збереження тегів",
+                    f"Не вдалося оновити мітки для '{supplier}': {exc}",
+                )
+
+        self._update_store_tree()
+        self._show_supplier_products()
+        if hasattr(self, "comparison_board"):
+            self.comparison_board.refresh()
+
+
+class JsonEditorDialog(tk.Toplevel):
+    """Simple JSON editor dialog used for templates and rules."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        path: Path,
+        title: str,
+        default_payload: Callable[[], Mapping[str, object]],
+    ) -> None:
+        super().__init__(master)
+        self.title(title)
+        self.path = Path(path)
+        self.default_payload = default_payload
+        self.result = False
+
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        text_frame = ttk.Frame(self)
+        text_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
+        text_frame.rowconfigure(0, weight=1)
+        text_frame.columnconfigure(0, weight=1)
+
+        self.text = tk.Text(text_frame, wrap=tk.NONE, undo=True)
+        self.text.grid(row=0, column=0, sticky="nsew")
+
+        y_scroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.text.yview)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll = ttk.Scrollbar(text_frame, orient=tk.HORIZONTAL, command=self.text.xview)
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        self.text.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        payload = self._load_content()
+        self.text.insert("1.0", payload)
+
+        button_frame = ttk.Frame(self)
+        button_frame.grid(row=1, column=0, sticky=tk.E, padx=8, pady=(0, 8))
+
+        ttk.Button(button_frame, text="Скасувати", command=self._on_cancel).pack(side=tk.RIGHT)
+        ttk.Button(button_frame, text="Зберегти", command=self._on_save).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+
+    def _load_content(self) -> str:
+        if self.path.exists():
+            try:
+                return self.path.read_text(encoding="utf-8")
+            except OSError:
+                pass
+        payload = self.default_payload()
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _on_save(self) -> None:
+        content = self.text.get("1.0", tk.END).strip() or "{}"
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as exc:
+            messagebox.showerror("Мітки", f"Некоректний JSON: {exc}")
+            return
+
+        formatted = json.dumps(data, ensure_ascii=False, indent=2)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(formatted + "\n", encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Мітки", f"Не вдалося зберегти файл: {exc}")
+            return
+
+        self.result = True
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.result = False
+        self.destroy()
+
+
+class TagSelectionDialog(tk.Toplevel):
+    """Dialog for confirming or rejecting proposed tags for a product."""
+
+    def __init__(self, master: tk.Misc, assignment: tags_assignment.TagAssignment) -> None:
+        super().__init__(master)
+        self.assignment = assignment
+        self.result: Set[str] | None = None
+
+        self.title("Підтвердження тегів")
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        ttk.Label(
+            self,
+            text=f"{assignment.product.sku or ''} — {assignment.product.name}",
+            wraplength=520,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=12, pady=(12, 4))
+
+        ttk.Label(
+            self,
+            text="Поточні теги: "
+            + (", ".join(sorted(assignment.current_tags)) or "—"),
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        body = ttk.Frame(self)
+        body.pack(fill=tk.BOTH, expand=True, padx=12)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(body, borderwidth=0, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        inner = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind(
+            "<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        proposed = sorted(assignment.proposed_tags)
+        self._tag_vars: Dict[str, tk.BooleanVar] = {}
+        if proposed:
+            for tag in proposed:
+                var = tk.BooleanVar(value=tag in assignment.selected_tags)
+                self._tag_vars[tag] = var
+                ttk.Checkbutton(inner, text=tag, variable=var).pack(
+                    anchor=tk.W, pady=2
+                )
+        else:
+            ttk.Label(inner, text="Немає запропонованих тегів.").pack(anchor=tk.W, pady=4)
+
+        inner.update_idletasks()
+
+        controls = ttk.Frame(self)
+        controls.pack(fill=tk.X, padx=12, pady=(8, 12))
+
+        ttk.Button(controls, text="Очистити", command=self._clear).pack(side=tk.LEFT)
+        ttk.Button(controls, text="Обрати всі", command=self._select_all).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(controls, text="Скасувати", command=self._on_cancel).pack(side=tk.RIGHT)
+        ttk.Button(controls, text="Готово", command=self._on_save).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+
+    def _clear(self) -> None:
+        for var in self._tag_vars.values():
+            var.set(False)
+
+    def _select_all(self) -> None:
+        for var in self._tag_vars.values():
+            var.set(True)
+
+    def _on_save(self) -> None:
+        if not self._tag_vars:
+            self.result = set()
+        else:
+            self.result = {tag for tag, var in self._tag_vars.items() if var.get()}
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+
+class TagsTab(ttk.Frame):
+    """Interactive tab for assigning tags to store and supplier products."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        data_dir: str | Path,
+        get_products: Callable[[], Sequence[Product]],
+        on_save: Callable[[Sequence[tags_assignment.TagAssignment]], None] | None = None,
+    ) -> None:
+        super().__init__(master)
+        self.data_dir = Path(data_dir)
+        self.get_products = get_products
+        self.on_save = on_save
+
+        self.templates_path = self.data_dir / "tag_templates.json"
+        self.rules_path = self.data_dir / "tag_rules.json"
+        self.assignments_path = self.data_dir / "tag_assignments.json"
+
+        self.templates = tags_assignment.load_tag_templates(self.templates_path)
+        self.rules = tags_assignment.load_tag_rules(self.rules_path)
+        self.saved_map = tags_assignment.load_saved_tags(self.assignments_path)
+
+        self.products: List[Product] = []
+        self.assignments: Dict[str, tags_assignment.TagAssignment] = {}
+
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._update_tree())
+
+        self._item_to_key: Dict[str, str] = {}
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def refresh_products(self, products: Sequence[Product] | None = None) -> None:
+        products = list(products or self.get_products())
+        self.products = products
+        self.saved_map = tags_assignment.load_saved_tags(self.assignments_path)
+
+        assignments: Dict[str, tags_assignment.TagAssignment] = {}
+        for product in products:
+            key = tags_assignment.make_assignment_key(
+                product.supplier, product.sku, product.name
+            )
+            current_tags = set(product.tags)
+            if key in self.saved_map:
+                current_tags.update(self.saved_map[key])
+            assignments[key] = tags_assignment.TagAssignment(
+                product=product,
+                current_tags=current_tags,
+            )
+
+        tags_assignment.validate_tags(assignments.values(), self.templates)
+        self.assignments = assignments
+        self._update_tree()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        controls = ttk.Frame(self)
+        controls.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+        ttk.Label(controls, text="Пошук:").grid(row=0, column=0, sticky=tk.W, padx=(0, 6))
+        search_entry = ttk.Entry(controls, textvariable=self.search_var)
+        search_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 12))
+        controls.columnconfigure(1, weight=1)
+
+        ttk.Button(
+            controls,
+            text="Автоматично присвоїти теги",
+            command=self._run_auto_tagging,
+        ).grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
+        ttk.Button(
+            controls,
+            text="Оновити мітки",
+            command=lambda: self._run_auto_tagging(reload_saved=True),
+        ).grid(row=0, column=3, sticky=tk.W)
+
+        ttk.Button(
+            controls,
+            text="Редагувати шаблони моделей",
+            command=self._edit_templates,
+        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        ttk.Button(
+            controls,
+            text="Редагувати правила тегування",
+            command=self._edit_rules,
+        ).grid(row=1, column=2, columnspan=2, sticky=tk.W, pady=(8, 0))
+
+        ttk.Button(
+            controls,
+            text="Масово застосувати обрані теги",
+            command=self._apply_to_selected,
+        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+        ttk.Button(
+            controls,
+            text="Зберегти теги",
+            command=self._save_assignments,
+        ).grid(row=2, column=2, columnspan=2, sticky=tk.E, pady=(8, 0))
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+        columns = ("sku", "name", "current", "proposed", "category", "apply")
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=columns,
+            show="headings",
+            selectmode="extended",
+        )
+        self.tree.grid(row=0, column=0, sticky="nsew")
+
+        y_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+        headers = {
+            "sku": "SKU",
+            "name": "Назва",
+            "current": "Поточні теги",
+            "proposed": "Пропоновані теги",
+            "category": "Категорія",
+            "apply": "✔",
+        }
+        widths = {
+            "sku": 130,
+            "name": 320,
+            "current": 220,
+            "proposed": 260,
+            "category": 140,
+            "apply": 40,
+        }
+        for column in columns:
+            self.tree.heading(column, text=headers[column])
+            self.tree.column(column, width=widths[column], anchor=tk.W)
+
+        self.tree.tag_configure("confirmed", background="#9bd179")
+        self.tree.tag_configure("pending", background="#f5e9a4")
+        self.tree.tag_configure("error", background="#d1a3a7")
+
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+        self.tree.bind("<Button-1>", self._on_tree_click, add="+")
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+    def _run_auto_tagging(self, reload_saved: bool = False) -> None:
+        if not self.products:
+            self.refresh_products()
+        if reload_saved:
+            self.saved_map = tags_assignment.load_saved_tags(self.assignments_path)
+
+        if not self.products:
+            messagebox.showinfo("Мітки", "Немає продуктів для обробки.")
+            return
+
+        computed = tags_assignment.apply_tags_to_products(
+            self.products, self.templates, self.rules, self.saved_map
+        )
+        updated: Dict[str, tags_assignment.TagAssignment] = {}
+        for assignment in computed:
+            key = tags_assignment.make_assignment_key(
+                assignment.product.supplier,
+                assignment.product.sku,
+                assignment.product.name,
+            )
+            existing = self.assignments.get(key)
+            if existing:
+                assignment.current_tags = set(existing.current_tags)
+                preserved = {
+                    tag for tag in existing.selected_tags if tag in assignment.proposed_tags
+                }
+                assignment.selected_tags |= preserved
+            updated[key] = assignment
+
+        self.assignments = updated
+        tags_assignment.validate_tags(self.assignments.values(), self.templates)
+        self._update_tree()
+
+    def _apply_to_selected(self) -> None:
+        changed = False
+        for item in self.tree.selection():
+            key = self._item_to_key.get(item)
+            if not key:
+                continue
+            assignment = self.assignments.get(key)
+            if not assignment:
+                continue
+            auto_pending = assignment.auto_tags & assignment.proposed_tags
+            if not auto_pending:
+                continue
+            before = set(assignment.selected_tags)
+            assignment.selected_tags.update(auto_pending)
+            if assignment.selected_tags != before:
+                changed = True
+
+        if changed:
+            tags_assignment.validate_tags(self.assignments.values(), self.templates)
+            self._update_tree()
+
+    def _save_assignments(self) -> None:
+        assignments = list(self.assignments.values())
+        for assignment in assignments:
+            if assignment.selected_tags:
+                assignment.current_tags.update(assignment.selected_tags)
+                assignment.proposed_tags.difference_update(assignment.selected_tags)
+                assignment.selected_tags.clear()
+
+        tags_assignment.validate_tags(assignments, self.templates)
+
+        try:
+            tags_assignment.save_tags(self.assignments_path, assignments)
+        except Exception as exc:
+            messagebox.showerror("Мітки", f"Не вдалося зберегти теги: {exc}")
+            return
+
+        self.saved_map = tags_assignment.load_saved_tags(self.assignments_path)
+        if self.on_save:
+            self.on_save(assignments)
+
+        self._update_tree()
+        messagebox.showinfo("Мітки", "Теги успішно збережено.")
+
+    def _edit_templates(self) -> None:
+        dialog = JsonEditorDialog(
+            self,
+            path=self.templates_path,
+            title="Шаблони моделей",
+            default_payload=tags_assignment.default_templates_payload,
+        )
+        self.wait_window(dialog)
+        if dialog.result:
+            self.templates = tags_assignment.load_tag_templates(self.templates_path)
+            messagebox.showinfo(
+                "Мітки",
+                "Шаблони моделей оновлено. Натисніть 'Оновити мітки' для перерахунку.",
+            )
+
+    def _edit_rules(self) -> None:
+        dialog = JsonEditorDialog(
+            self,
+            path=self.rules_path,
+            title="Правила тегування",
+            default_payload=tags_assignment.default_rules_payload,
+        )
+        self.wait_window(dialog)
+        if dialog.result:
+            self.rules = tags_assignment.load_tag_rules(self.rules_path)
+            messagebox.showinfo(
+                "Мітки",
+                "Правила оновлено. Натисніть 'Оновити мітки' для перерахунку.",
+            )
+
+    # ------------------------------------------------------------------
+    # Tree helpers
+    # ------------------------------------------------------------------
+    def _update_tree(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._item_to_key.clear()
+
+        query = self.search_var.get().strip().lower()
+
+        sorted_items = sorted(
+            self.assignments.items(),
+            key=lambda item: (
+                (item[1].product.name or "").lower(),
+                item[1].product.sku or "",
+            ),
+        )
+
+        for key, assignment in sorted_items:
+            haystack = " ".join(
+                filter(
+                    None,
+                    [
+                        assignment.product.sku,
+                        assignment.product.name,
+                        " ".join(sorted(assignment.current_tags)),
+                        " ".join(sorted(assignment.proposed_tags)),
+                    ],
+                )
+            ).lower()
+            if query and query not in haystack:
+                continue
+
+            current_display = ", ".join(sorted(assignment.current_tags)) or "—"
+
+            proposed_display: List[str] = []
+            for tag in sorted(assignment.proposed_tags):
+                markers: List[str] = []
+                if tag in assignment.selected_tags:
+                    markers.append("✔")
+                origins: List[str] = []
+                if tag in assignment.auto_tags:
+                    origins.append("auto")
+                if tag in assignment.rule_tags:
+                    origins.append("rule")
+                suffix = f" ({', '.join(origins)})" if origins else ""
+                prefix = " ".join(markers) + (" " if markers else "")
+                proposed_display.append(f"{prefix}{tag}{suffix}".strip())
+
+            if assignment.validation_errors:
+                proposed_display.append("⚠ " + "; ".join(assignment.validation_errors))
+
+            proposed_column = ", ".join(proposed_display) if proposed_display else "—"
+
+            category = assignment.category or "—"
+            apply_marker = "✔" if assignment.selected_tags else ""
+
+            item_id = self.tree.insert(
+                "",
+                tk.END,
+                values=(
+                    assignment.product.sku or "",
+                    assignment.product.name,
+                    current_display,
+                    proposed_column,
+                    category,
+                    apply_marker,
+                ),
+            )
+
+            row_tags: List[str] = []
+            if assignment.validation_errors:
+                row_tags.append("error")
+            elif assignment.selected_tags:
+                row_tags.append("confirmed")
+            elif assignment.proposed_tags:
+                row_tags.append("pending")
+            elif assignment.current_tags:
+                row_tags.append("confirmed")
+
+            if row_tags:
+                self.tree.item(item_id, tags=tuple(row_tags))
+
+            self._item_to_key[item_id] = key
+
+    def _on_tree_double_click(self, event: tk.Event[tk.Misc]) -> None:  # type: ignore[name-defined]
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        key = self._item_to_key.get(item)
+        if not key:
+            return
+        assignment = self.assignments.get(key)
+        if not assignment or not assignment.proposed_tags:
+            return
+        dialog = TagSelectionDialog(self, assignment)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        assignment.selected_tags = set(dialog.result)
+        tags_assignment.validate_tags([assignment], self.templates)
+        self._update_tree()
+
+    def _on_tree_click(self, event: tk.Event[tk.Misc]) -> str | None:  # type: ignore[name-defined]
+        region = self.tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return None
+        column = self.tree.identify_column(event.x)
+        if column != "#6":
+            return None
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return None
+        self.tree.selection_set(item)
+        self._toggle_apply(item)
+        return "break"
+
+    def _toggle_apply(self, item: str) -> None:
+        key = self._item_to_key.get(item)
+        if not key:
+            return
+        assignment = self.assignments.get(key)
+        if not assignment:
+            return
+
+        auto_pending = assignment.auto_tags & assignment.proposed_tags
+        if not auto_pending:
+            auto_pending = set(assignment.proposed_tags)
+        if not auto_pending:
+            return
+
+        if auto_pending <= assignment.selected_tags:
+            assignment.selected_tags.difference_update(auto_pending)
+        else:
+            assignment.selected_tags.update(auto_pending)
+
+        tags_assignment.validate_tags([assignment], self.templates)
+        self._update_tree()
 
 @dataclass
 class ComparisonRow:
