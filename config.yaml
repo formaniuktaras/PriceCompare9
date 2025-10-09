@@ -1,0 +1,9 @@
+data_root: "data"
+suppliers:
+  - key: "itsellopt"
+    paths: ["samples/itsellopt.csv", "samples/itsellopt.xlsx"]
+  - key: "ab_store"
+    paths: ["samples/ab_store.xlsx"]
+matching:
+  brand_aliases: {"mi": "xiaomi", "apple inc.": "apple"}
+  fuzzy_thresholds: {strong: 92, medium: 85, weak: 75}
