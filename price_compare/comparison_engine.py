@@ -5,9 +5,8 @@ from __future__ import annotations
 import hashlib
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, FrozenSet, List, Sequence, Set, Tuple
 
-from .comparator import PriceComparator
 from .models import PriceList, Product
 
 
@@ -31,10 +30,6 @@ def _tokenize_product(product: Product) -> List[str]:
             seen[token] = None
             unique_tokens.append(token)
     return unique_tokens
-
-
-def _comparable_text(product: Product) -> str:
-    return " ".join(_tokenize_product(product))
 
 
 @dataclass
@@ -70,23 +65,42 @@ class ComparisonBuilder:
         self.supplier_lists = list(supplier_lists)
         self.min_similarity = min_similarity
         self.max_matches = max_matches
-        self._comparator = PriceComparator([])
+        self._token_cache: Dict[int, FrozenSet[str]] = {}
 
     def build(self) -> List[ComparisonGroup]:
-        supplier_pool: List[Tuple[str, Product]] = []
+        supplier_pool: List[Tuple[str, Product, FrozenSet[str]]] = []
         supplier_stats: Dict[str, float] = {}
+        token_index: Dict[str, List[int]] = defaultdict(list)
+        sku_index: Dict[str, List[int]] = defaultdict(list)
+
         for price_list in self.supplier_lists:
             for product in price_list.products:
                 match_id = self._match_id(product)
-                supplier_pool.append((match_id, product))
+                tokens = self._token_set(product)
+                index = len(supplier_pool)
+                supplier_pool.append((match_id, product, tokens))
                 supplier_stats[match_id] = 0.0
+                if product.sku:
+                    sku_index[product.sku.lower()].append(index)
+                for token in tokens:
+                    token_index[token].append(index)
 
         groups: List[ComparisonGroup] = []
         for product in sorted(self.store_products, key=lambda item: item.name.lower()):
             group_id = self._group_id(product)
             matches: List[SupplierMatch] = []
-            for match_id, supplier_product in supplier_pool:
-                similarity = self._product_similarity(product, supplier_product)
+            store_tokens = self._token_set(product)
+            candidate_indices: Set[int] = set()
+            if product.sku:
+                candidate_indices.update(sku_index.get(product.sku.lower(), []))
+            for token in store_tokens:
+                candidate_indices.update(token_index.get(token, []))
+
+            for index in candidate_indices:
+                match_id, supplier_product, supplier_tokens = supplier_pool[index]
+                similarity = self._similarity(
+                    product, store_tokens, supplier_product, supplier_tokens
+                )
                 supplier_stats[match_id] = max(supplier_stats[match_id], similarity)
                 if similarity >= self.min_similarity:
                     matches.append(
@@ -123,26 +137,47 @@ class ComparisonBuilder:
         base = product.sku or product.name or "product"
         return f"store::{_stable_hash(base)}"
 
-    def _product_similarity(self, store_product: Product, supplier_product: Product) -> float:
+    def _token_set(self, product: Product) -> FrozenSet[str]:
+        key = id(product)
+        cached = self._token_cache.get(key)
+        if cached is None:
+            cached = frozenset(_tokenize_product(product))
+            self._token_cache[key] = cached
+        return cached
+
+    def _similarity(
+        self,
+        store_product: Product,
+        store_tokens: FrozenSet[str],
+        supplier_product: Product,
+        supplier_tokens: FrozenSet[str],
+    ) -> float:
         if store_product.sku and supplier_product.sku:
             if store_product.sku.lower() == supplier_product.sku.lower():
                 return 1.0
-        left = _comparable_text(store_product)
-        right = _comparable_text(supplier_product)
-        if not left or not right:
+        if not store_tokens or not supplier_tokens:
             return 0.0
-        return self._comparator._name_similarity(left, right)
+        intersection = store_tokens & supplier_tokens
+        if not intersection:
+            return 0.0
+        union = store_tokens | supplier_tokens
+        if not union:
+            return 0.0
+        return len(intersection) / len(union)
 
     def _build_supplier_only_groups(
         self,
-        supplier_pool: Sequence[Tuple[str, Product]],
+        supplier_pool: Sequence[Tuple[str, Product, FrozenSet[str]]],
         stats: Dict[str, float],
     ) -> List[ComparisonGroup]:
         buckets: Dict[str, List[Tuple[str, Product]]] = defaultdict(list)
-        for match_id, product in supplier_pool:
+        for match_id, product, tokens in supplier_pool:
             if stats.get(match_id, 0.0) >= self.min_similarity:
                 continue
-            key = " ".join(_tokenize_product(product)) or product.name.lower()
+            if tokens:
+                key = " ".join(sorted(tokens))
+            else:
+                key = product.name.lower()
             buckets[key].append((match_id, product))
 
         groups: List[ComparisonGroup] = []
