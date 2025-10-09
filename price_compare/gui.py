@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import re
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -867,6 +869,364 @@ class JsonEditorDialog(tk.Toplevel):
         self.destroy()
 
 
+_CONDITION_PATTERN = re.compile(
+    r"REGEXMATCH\s*\(\s*\{\{\s*name\s*\}\}\s*,\s*(?P<literal>(\"(?:\\.|[^\"])*\")|('(?:\\.|[^'])*'))\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _escape_condition(condition: str) -> str:
+    escaped = condition.replace("\\", "\\\\").replace("\"", r"\"")
+    return escaped
+
+
+def _conditions_to_formula(conditions: Sequence[str]) -> str:
+    if not conditions:
+        return ""
+    parts = [
+        f'REGEXMATCH({{{{name}}}},"{_escape_condition(condition)}")' for condition in conditions
+    ]
+    joined = ", ".join(parts)
+    return f"=IF(AND({joined}))"
+
+
+def _formula_to_conditions(formula: str) -> List[str]:
+    conditions: List[str] = []
+    for match in _CONDITION_PATTERN.finditer(formula or ""):
+        literal = match.group("literal")
+        try:
+            value = ast.literal_eval(literal)
+        except (SyntaxError, ValueError):
+            value = literal[1:-1]
+        if value:
+            conditions.append(value)
+    return conditions
+
+
+class TagRuleRow:
+    """Represents a single editable tag rule in the visual editor."""
+
+    def __init__(
+        self,
+        editor: "TagRulesEditor",
+        master: ttk.Frame,
+        data: Mapping[str, object],
+    ) -> None:
+        self.editor = editor
+        self.master = master
+        self.name = str(data.get("name") or editor.generate_default_name())
+        self.auto_confirm = bool(data.get("auto_confirm", True))
+        self.tags: List[str] = [str(tag) for tag in data.get("tags", []) if str(tag).strip()]
+        formula = str(data.get("formula") or "").strip()
+
+        self.frame = ttk.Frame(master)
+        self.frame.columnconfigure(0, weight=3)
+        self.frame.columnconfigure(1, weight=2)
+
+        self.condition_text = tk.Text(self.frame, height=3, width=60, wrap=tk.WORD)
+        self.condition_text.insert("1.0", formula)
+        self.condition_text.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+        tags_wrapper = ttk.Frame(self.frame)
+        tags_wrapper.grid(row=0, column=1, sticky="nw")
+
+        self.tags_container = ttk.Frame(tags_wrapper)
+        self.tags_container.pack(anchor="w")
+
+        ttk.Button(
+            tags_wrapper,
+            text="+",
+            width=3,
+            command=self.prompt_add_tag,
+        ).pack(anchor="w", pady=(4, 0))
+
+        ttk.Button(
+            self.frame,
+            text="×",
+            width=3,
+            command=lambda: self.editor.remove_row(self),
+        ).grid(row=0, column=2, sticky="ne")
+
+        self.refresh_tags()
+
+    def focus(self) -> None:
+        self.condition_text.focus_set()
+
+    def refresh_tags(self) -> None:
+        for child in self.tags_container.winfo_children():
+            child.destroy()
+
+        if not self.tags:
+            ttk.Label(self.tags_container, text="(Немає тегів)").pack(anchor="w", pady=2)
+            return
+
+        for tag in self.tags:
+            pill = ttk.Frame(self.tags_container)
+            pill.pack(side=tk.LEFT, padx=2, pady=2)
+
+            tk.Label(
+                pill,
+                text=tag,
+                bg="#e7f1ff",
+                fg="#1a3d7c",
+                padx=8,
+                pady=2,
+                bd=1,
+                relief=tk.SOLID,
+            ).pack(side=tk.LEFT)
+
+            ttk.Button(
+                pill,
+                text="×",
+                width=2,
+                command=lambda value=tag: self.remove_tag(value),
+            ).pack(side=tk.LEFT, padx=(2, 0))
+
+    def prompt_add_tag(self) -> None:
+        value = simpledialog.askstring("Мітки", "Нова мітка", parent=self.editor)
+        if not value:
+            return
+        self.add_tag(value)
+
+    def add_tag(self, tag: str) -> None:
+        cleaned = tag.strip()
+        if not cleaned:
+            return
+        if cleaned in self.tags:
+            return
+        self.tags.append(cleaned)
+        self.refresh_tags()
+
+    def remove_tag(self, tag: str) -> None:
+        self.tags = [value for value in self.tags if value != tag]
+        self.refresh_tags()
+
+    def get_data(self) -> Dict[str, object]:
+        formula = self.condition_text.get("1.0", tk.END).strip()
+        return {
+            "name": self.name,
+            "formula": formula,
+            "tags": list(self.tags),
+            "auto_confirm": self.auto_confirm,
+        }
+
+    def destroy(self) -> None:
+        self.frame.destroy()
+
+
+class TagRulesEditor(tk.Toplevel):
+    """Visual editor for tag rules with condition formulas and tag capsules."""
+
+    def __init__(self, master: tk.Misc, *, path: Path) -> None:
+        super().__init__(master)
+        self.title("Правила тегування")
+        self.path = Path(path)
+        self.result = False
+
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        self.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            self,
+            text="Правила тегування",
+            font=("TkDefaultFont", 12, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 4))
+
+        header = ttk.Frame(self)
+        header.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12)
+        header.columnconfigure(0, weight=3)
+        header.columnconfigure(1, weight=2)
+        ttk.Label(header, text="Умова").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="Мітки").grid(row=0, column=1, sticky="w")
+
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        self.canvas.grid(row=2, column=0, sticky="nsew", padx=(12, 0), pady=(4, 12))
+        self.rowconfigure(2, weight=1)
+
+        scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
+        scrollbar.grid(row=2, column=1, sticky="ns", pady=(4, 12))
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.table_container = ttk.Frame(self.canvas)
+        self.table_container.columnconfigure(0, weight=1)
+
+        self._table_window = self.canvas.create_window(
+            (0, 0), window=self.table_container, anchor="nw"
+        )
+
+        self.table_container.bind(
+            "<Configure>",
+            lambda event: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
+        )
+        self.canvas.bind(
+            "<Configure>",
+            lambda event: self.canvas.itemconfigure(self._table_window, width=event.width),
+        )
+
+        self.rows: List[TagRuleRow] = []
+        self._name_counter = 1
+
+        for data in self._load_rules():
+            self._add_row(data)
+
+        quick_add = ttk.Frame(self)
+        quick_add.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+        quick_add.columnconfigure(0, weight=3)
+        quick_add.columnconfigure(1, weight=2)
+
+        ttk.Label(quick_add, text="Нова умова:").grid(row=0, column=0, sticky="w")
+        ttk.Label(quick_add, text="Мітки (через кому):").grid(row=0, column=1, sticky="w")
+
+        self.new_condition = tk.Text(quick_add, height=3, width=60, wrap=tk.WORD)
+        self.new_condition.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+
+        self.new_tags_entry = ttk.Entry(quick_add)
+        self.new_tags_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8))
+
+        ttk.Button(quick_add, text="Додати", command=self._add_from_inputs).grid(
+            row=1, column=2, sticky="e"
+        )
+
+        button_frame = ttk.Frame(self)
+        button_frame.grid(row=4, column=0, columnspan=2, sticky="e", padx=12, pady=(0, 12))
+
+        ttk.Button(button_frame, text="Скасувати", command=self._on_cancel).pack(side=tk.RIGHT)
+        ttk.Button(button_frame, text="Зберегти", command=self._on_save).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+
+    def generate_default_name(self) -> str:
+        name = f"Rule {self._name_counter}"
+        self._name_counter += 1
+        return name
+
+    def _load_rules(self) -> List[Dict[str, object]]:
+        if not self.path.exists():
+            payload = tags_assignment.default_rules_payload()
+        else:
+            try:
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = tags_assignment.default_rules_payload()
+
+        rules_data: List[Dict[str, object]] = []
+        for rule in payload.get("rules", []):
+            conditions_value = rule.get("conditions", [])
+            if isinstance(conditions_value, list):
+                normalized_conditions = [str(cond) for cond in conditions_value if str(cond)]
+            else:
+                normalized_conditions = []
+
+            formula = _conditions_to_formula(normalized_conditions)
+            if not formula:
+                condition_formula = str(rule.get("condition") or "").strip()
+                if condition_formula:
+                    formula = condition_formula
+                    parsed = _formula_to_conditions(condition_formula)
+                    if parsed:
+                        normalized_conditions = parsed
+            rules_data.append(
+                {
+                    "name": rule.get("name") or self.generate_default_name(),
+                    "tags": [str(tag) for tag in rule.get("tags", []) if str(tag).strip()],
+                    "formula": formula,
+                    "auto_confirm": bool(rule.get("auto_confirm", True)),
+                    }
+            )
+        if rules_data:
+            self._name_counter = len(rules_data) + 1
+        return rules_data
+
+    def _add_row(self, data: Mapping[str, object]) -> TagRuleRow:
+        row = TagRuleRow(self, self.table_container, data)
+        self.rows.append(row)
+        self._reflow_rows()
+        return row
+
+    def _reflow_rows(self) -> None:
+        for index, row in enumerate(self.rows):
+            row.frame.grid(row=index, column=0, sticky="ew", pady=4)
+
+    def remove_row(self, row: TagRuleRow) -> None:
+        if row in self.rows:
+            self.rows.remove(row)
+            row.destroy()
+            self._reflow_rows()
+
+    def _add_from_inputs(self) -> None:
+        condition = self.new_condition.get("1.0", tk.END).strip()
+        tags_text = self.new_tags_entry.get().strip()
+
+        if not condition:
+            messagebox.showwarning("Правила", "Введіть формулу умови.", parent=self)
+            return
+
+        tags = [tag.strip() for tag in tags_text.split(",") if tag.strip()]
+        if not tags:
+            messagebox.showwarning("Правила", "Додайте принаймні одну мітку.", parent=self)
+            return
+
+        row = self._add_row({"formula": condition, "tags": tags, "auto_confirm": True})
+        row.focus()
+
+        self.new_condition.delete("1.0", tk.END)
+        self.new_tags_entry.delete(0, tk.END)
+        self.canvas.yview_moveto(1.0)
+
+    def _collect_rows(self) -> List[Dict[str, object]]:
+        collected: List[Dict[str, object]] = []
+        for row in self.rows:
+            data = row.get_data()
+            formula = data.get("formula", "")
+            tags = data.get("tags", [])
+            if not formula and not tags:
+                continue
+            conditions = _formula_to_conditions(str(formula))
+            if not conditions:
+                messagebox.showerror(
+                    "Правила",
+                    "Кожне правило повинно містити щонайменше одну умову REGEXMATCH.",
+                    parent=self,
+                )
+                return []
+            if not tags:
+                messagebox.showerror(
+                    "Правила", "Кожне правило повинно містити хоча б одну мітку.", parent=self
+                )
+                return []
+            collected.append(
+                {
+                    "name": data.get("name") or self.generate_default_name(),
+                    "conditions": conditions,
+                    "tags": list(tags),
+                    "auto_confirm": bool(data.get("auto_confirm", True)),
+                }
+            )
+        return collected
+
+    def _on_save(self) -> None:
+        payload = self._collect_rows()
+        if not payload and self.rows:
+            return
+
+        data = {"rules": payload}
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Правила", f"Не вдалося зберегти файл: {exc}", parent=self)
+            return
+
+        self.result = True
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.result = False
+        self.destroy()
+
 class TagSelectionDialog(tk.Toplevel):
     """Dialog for confirming or rejecting proposed tags for a product."""
 
@@ -1204,12 +1564,7 @@ class TagsTab(ttk.Frame):
             )
 
     def _edit_rules(self) -> None:
-        dialog = JsonEditorDialog(
-            self,
-            path=self.rules_path,
-            title="Правила тегування",
-            default_payload=tags_assignment.default_rules_payload,
-        )
+        dialog = TagRulesEditor(self, path=self.rules_path)
         self.wait_window(dialog)
         if dialog.result:
             self.rules = tags_assignment.load_tag_rules(self.rules_path)
