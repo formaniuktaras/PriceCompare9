@@ -10,7 +10,17 @@ import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, TypeVar
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    TypeVar,
+    TYPE_CHECKING,
+)
 
 from .comparison_engine import ComparisonBuilder, ComparisonGroup, SupplierMatch
 from .comparison_state import ComparisonStateStore
@@ -22,6 +32,9 @@ from .search import ProductSearch
 from .tagging import Tagger
 from . import tags_assignment
 from .templates import ImportTemplate, ImportTemplateStore
+
+if TYPE_CHECKING:
+    from .synonyms_manager import SynonymsManager
 
 
 def _format_price(product: Product) -> str:
@@ -104,6 +117,8 @@ class PriceCompareApp(tk.Tk):
         self.template_store = ImportTemplateStore(data_dir=data_dir)
         self.tagger = Tagger.from_json(tags_config) if tags_config else Tagger()
         self._tags_config_path: str | None = str(tags_config) if tags_config else None
+
+        self.synonyms_path = self.repository.data_dir / "synonyms.json"
 
         self.comparison_state = ComparisonStateStore(
             self.repository.data_dir / "comparison_state.json"
@@ -199,11 +214,31 @@ class PriceCompareApp(tk.Tk):
         settings_menu = tk.Menu(menubar, tearoff=False)
         menubar.add_cascade(label="Налаштування", menu=settings_menu)
         settings_menu.add_command(
+            label="Синоніми",
+            command=self._open_synonyms_manager,
+        )
+        settings_menu.add_separator()
+        settings_menu.add_command(
             label="Завантажити правила тегування",
             command=self._load_tag_rules,
         )
         settings_menu.add_separator()
         settings_menu.add_command(label="Вийти", command=self.destroy)
+
+    def _open_synonyms_manager(self) -> None:
+        try:
+            from .synonyms_manager import open_synonyms_window
+        except Exception as exc:  # pragma: no cover - defensive UI path
+            messagebox.showerror(
+                "Синоніми",
+                f"Не вдалося відкрити редактор синонімів.\n\n{exc}",
+            )
+            return
+
+        path = self.synonyms_path
+        open_synonyms_window(path)
+        if hasattr(self, "tags_board"):
+            self.tags_board.invalidate_synonyms_cache()
 
     def _build_main_price_tab(self) -> None:
         toolbar = ttk.Frame(self.main_price_tab)
@@ -369,6 +404,7 @@ class PriceCompareApp(tk.Tk):
         self.tags_board = TagsTab(
             self.tags_tab,
             data_dir=self.repository.data_dir,
+            synonyms_path=self.synonyms_path,
             get_products=self._all_products_for_tags,
             on_save=self._on_tags_saved,
         )
@@ -1933,17 +1969,20 @@ class TagsTab(ttk.Frame):
         master: tk.Misc,
         *,
         data_dir: str | Path,
+        synonyms_path: str | Path | None = None,
         get_products: Callable[[], Sequence[Product]],
         on_save: Callable[[Sequence[tags_assignment.TagAssignment]], None] | None = None,
     ) -> None:
         super().__init__(master)
         self.data_dir = Path(data_dir)
+        self.synonyms_path = Path(synonyms_path) if synonyms_path else self.data_dir / "synonyms.json"
         self.get_products = get_products
         self.on_save = on_save
 
         self.models_path = self.data_dir / "models.json"
         self.rules_path = self.data_dir / "tag_rules.json"
         self.assignments_path = self.data_dir / "tag_assignments.json"
+        self._synonyms_manager: SynonymsManager | None = None
 
         self.templates = tags_assignment.load_tag_templates(self.models_path)
         self.rules = tags_assignment.load_tag_rules(self.rules_path)
@@ -1958,6 +1997,18 @@ class TagsTab(ttk.Frame):
         self._item_to_key: Dict[str, str] = {}
 
         self._build_ui()
+
+    def invalidate_synonyms_cache(self) -> None:
+        self._synonyms_manager = None
+
+    def _get_synonyms_manager(self) -> SynonymsManager:
+        if self._synonyms_manager is None:
+            from .synonyms_manager import SynonymsManager  # Local import to avoid GUI dependency at module load
+
+            self._synonyms_manager = SynonymsManager(self.synonyms_path)
+        else:
+            self._synonyms_manager.synonyms = self._synonyms_manager.load_synonyms()
+        return self._synonyms_manager
 
     # ------------------------------------------------------------------
     # Public API
@@ -2089,8 +2140,13 @@ class TagsTab(ttk.Frame):
             messagebox.showinfo("Мітки", "Немає продуктів для обробки.")
             return
 
+        synonyms_manager = self._get_synonyms_manager()
         computed = tags_assignment.apply_tags_to_products(
-            self.products, self.templates, self.rules, self.saved_map
+            self.products,
+            self.templates,
+            self.rules,
+            self.saved_map,
+            synonyms_manager=synonyms_manager,
         )
         updated: Dict[str, tags_assignment.TagAssignment] = {}
         for assignment in computed:
