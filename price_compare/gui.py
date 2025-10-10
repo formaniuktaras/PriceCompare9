@@ -1458,18 +1458,45 @@ class ModelTemplatesDialog(tk.Toplevel):
         if not (self.selected_category and self.selected_brand):
             messagebox.showwarning("Моделі", "Оберіть бренд для додавання моделі.", parent=self)
             return
-        name = simpledialog.askstring("Нова модель", "Введіть назву моделі:", parent=self)
-        if not name:
+        raw_input = simpledialog.askstring(
+            "Нова модель",
+            "Введіть назву моделі або декілька через кому:",
+            parent=self,
+        )
+        if not raw_input:
             return
-        try:
-            self.manager.add_model(self.selected_category, self.selected_brand, name)
-            self.manager.save_data()
-        except ValueError as exc:
-            messagebox.showerror("Моделі", str(exc), parent=self)
+        candidates = [part.strip() for part in raw_input.split(",") if part.strip()]
+        if not candidates:
             return
+        added: List[str] = []
+        errors: List[str] = []
+        for candidate in candidates:
+            try:
+                self.manager.add_model(
+                    self.selected_category,
+                    self.selected_brand,
+                    candidate,
+                )
+                added.append(candidate)
+            except ValueError as exc:
+                errors.append(f"• {candidate}: {exc}")
+        if not added:
+            messagebox.showerror(
+                "Моделі",
+                "Не вдалося додати жодної моделі:\n" + "\n".join(errors),
+                parent=self,
+            )
+            return
+        self.manager.save_data()
         self._mark_modified()
-        self.selected_model = name.strip()
+        self.selected_model = added[-1]
         self._refresh_models(select=self.selected_model)
+        if errors:
+            messagebox.showwarning(
+                "Моделі",
+                "Деякі моделі не додано:\n" + "\n".join(errors),
+                parent=self,
+            )
 
     def _rename_model(self) -> None:
         if not (self.selected_category and self.selected_brand and self.selected_model):
