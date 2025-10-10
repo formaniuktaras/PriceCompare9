@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import json
 import os
 import re
 from pathlib import Path
 from typing import Dict, List
-
-import PySimpleGUI as sg
 
 
 class SynonymsManager:
@@ -82,6 +82,14 @@ class SynonymsManager:
 
 
 def open_synonyms_window(filename: str | os.PathLike[str] = "synonyms.json") -> None:
+    if importlib.util.find_spec("PySimpleGUI") is None:
+        raise ModuleNotFoundError(
+            "PySimpleGUI is required to open the synonyms editor. "
+            "Install it with 'pip install PySimpleGUI'."
+        )
+
+    sg = importlib.import_module("PySimpleGUI")
+
     manager = SynonymsManager(filename)
     data = [[c, ", ".join(v)] for c, v in manager.synonyms.items()]
     table = sg.Table(
