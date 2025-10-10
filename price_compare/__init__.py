@@ -7,6 +7,7 @@ from .comparator import PriceComparator
 from .gui import PriceCompareApp, run_app
 from .io import PriceListImporter, PriceListExporter
 from .search import ProductSearch
+from .synonyms_manager import SynonymsManager, open_synonyms_window
 
 __all__ = [
     "Product",
@@ -19,5 +20,7 @@ __all__ = [
     "ProductSearch",
     "PriceListImporter",
     "PriceListExporter",
+    "SynonymsManager",
+    "open_synonyms_window",
     "run_app",
 ]
