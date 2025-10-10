@@ -1,0 +1,8 @@
+{
+  "iphone": ["айфон", "iphon", "ipfone"],
+  "plus": ["+", "плюс"],
+  "magsafe": ["магсейф", "mag safe", "mag-safe"],
+  "case": ["чохол", "накладка", "кейс"],
+  "hydrogel": ["гідрогель", "hydro film", "soft film"],
+  "glass": ["скло", "glass", "захисне скло"]
+}

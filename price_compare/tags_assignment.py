@@ -6,10 +6,23 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set
+from typing import (
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    Set,
+    TYPE_CHECKING,
+)
 
 from .models import Product
 from .model_templates import ModelTemplatesEditor
+
+if TYPE_CHECKING:
+    from .synonyms_manager import SynonymsManager
 
 # ---------------------------------------------------------------------------
 # Domain objects
@@ -357,6 +370,25 @@ def match_models(product_name: str, templates: Sequence[ModelTemplate]) -> Set[s
     return {tag for tag in template.tags if tag}
 
 
+def apply_tag_rules(
+    normalized_name: str,
+    normalized_desc: str,
+    rules: Sequence[TagRule],
+) -> Set[str]:
+    """Return tags derived from declarative rules for normalized text."""
+
+    haystack = " ".join(
+        part.strip()
+        for part in (normalized_name or "", normalized_desc or "")
+        if part and part.strip()
+    )
+    derived: Set[str] = set()
+    for rule in rules:
+        if rule.matches(haystack):
+            derived.update(tag for tag in rule.tags if tag)
+    return derived
+
+
 def determine_category(tags: Iterable[str]) -> str | None:
     for tag in tags:
         if _is_type_tag(tag):
@@ -403,9 +435,16 @@ def apply_tags_to_products(
     templates: Sequence[ModelTemplate],
     rules: Sequence[TagRule],
     saved_tags: Mapping[str, Set[str]] | None = None,
+    *,
+    synonyms_manager: "SynonymsManager" | None = None,
 ) -> List[TagAssignment]:
     saved_tags = saved_tags or {}
     assignments: List[TagAssignment] = []
+
+    if synonyms_manager is None:
+        from .synonyms_manager import SynonymsManager  # Local import to avoid GUI dependency at module load
+
+        synonyms_manager = SynonymsManager()
 
     for product in products:
         key = make_assignment_key(product.supplier, product.sku, product.name)
@@ -414,13 +453,21 @@ def apply_tags_to_products(
             current_tags.update(saved_tags[key])
 
         name = product.name or ""
+        description = product.description or ""
 
-        auto_tags = match_models(name, templates)
+        normalized_payload = synonyms_manager.preprocess_product(
+            {"name": name, "description": description}
+        )
+        normalized_name = normalized_payload.get("normalized_name", name.lower())
+        normalized_desc = normalized_payload.get("normalized_desc", description.lower())
 
-        rule_tags: Set[str] = set()
-        for rule in rules:
-            if rule.matches(name):
-                rule_tags.update(tag for tag in rule.tags if tag)
+        product.extra["normalized_name"] = normalized_name
+        product.extra["normalized_desc"] = normalized_desc
+        setattr(product, "normalized_name", normalized_name)
+        setattr(product, "normalized_desc", normalized_desc)
+
+        auto_tags = match_models(normalized_name, templates)
+        rule_tags = apply_tag_rules(normalized_name, normalized_desc, rules)
 
         proposed = (auto_tags | rule_tags) - current_tags
         selected = {tag for tag in rule_tags if tag not in current_tags}
@@ -442,6 +489,7 @@ __all__ = [
     "ModelTemplate",
     "TagRule",
     "TagAssignment",
+    "apply_tag_rules",
     "apply_tags_to_products",
     "default_rules_payload",
     "default_templates_payload",
