@@ -6,9 +6,10 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence, Set
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set
 
 from .models import Product
+from .model_templates import ModelTemplatesEditor
 
 # ---------------------------------------------------------------------------
 # Domain objects
@@ -17,18 +18,32 @@ from .models import Product
 
 @dataclass
 class ModelTemplate:
-    """Represents a brand/model template that should become a tag."""
+    """Represents a compiled model template with metadata and tags."""
 
-    tag: str
+    category: str
+    brand: str
+    name: str
     pattern: str
-    category: str = "Модель пристрою"
+    tags: Sequence[str]
 
     def __post_init__(self) -> None:
-        flags = re.IGNORECASE
-        self._regex = re.compile(self.pattern, flags)
+        try:
+            self._regex: re.Pattern[str] | None = re.compile(self.pattern, re.IGNORECASE)
+        except re.error:
+            self._regex = None
 
     def iter_matches(self, text: str) -> Sequence[re.Match[str]]:
+        if not self._regex:
+            return []
         return list(self._regex.finditer(text))
+
+    def match_length(self, text: str) -> int:
+        """Return the maximum match length for the provided text."""
+
+        matches = self.iter_matches(text)
+        if not matches:
+            return 0
+        return max(len(match.group(0)) for match in matches)
 
 
 @dataclass
@@ -66,16 +81,7 @@ class TagAssignment:
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_MODEL_TEMPLATES: List[Dict[str, str]] = [
-    {"tag": "Apple iPhone 15", "pattern": r"\\bApple iPhone 15\\b"},
-    {"tag": "Apple iPhone 15 Pro", "pattern": r"\\bApple iPhone 15 Pro\\b"},
-    {"tag": "Apple iPhone 15 Pro Max", "pattern": r"\\bApple iPhone 15 Pro Max\\b"},
-    {"tag": "Xiaomi Redmi Note 12 4G", "pattern": r"\\bXiaomi Redmi Note 12 4G\\b"},
-    {"tag": "Xiaomi Redmi Note 12 Pro", "pattern": r"\\bXiaomi Redmi Note 12 Pro\\b"},
-    {"tag": "Samsung Galaxy S23", "pattern": r"\\bSamsung Galaxy S23\\b"},
-    {"tag": "Samsung Galaxy S23 Ultra", "pattern": r"\\bSamsung Galaxy S23 Ultra\\b"},
-    {"tag": "Realme 13", "pattern": r"\\bRealme 13\\b"},
-]
+DEFAULT_MODELS_PAYLOAD: Dict[str, object] = ModelTemplatesEditor.default_payload()
 
 
 DEFAULT_TAG_RULES_PAYLOAD: Dict[str, List[Dict[str, object]]] = {
@@ -171,8 +177,8 @@ MODEL_KEYWORDS = re.compile(
 )
 
 
-def default_templates_payload() -> Dict[str, List[Dict[str, str]]]:
-    return {"models": list(DEFAULT_MODEL_TEMPLATES)}
+def default_templates_payload() -> Dict[str, object]:
+    return json.loads(json.dumps(DEFAULT_MODELS_PAYLOAD))
 
 
 def default_rules_payload() -> Dict[str, List[Dict[str, object]]]:
@@ -180,21 +186,19 @@ def default_rules_payload() -> Dict[str, List[Dict[str, object]]]:
 
 
 def load_tag_templates(path: str | Path) -> List[ModelTemplate]:
-    path = Path(path)
-    if not path.exists():
-        return [ModelTemplate(**item) for item in DEFAULT_MODEL_TEMPLATES]
-
-    with path.open("r", encoding="utf-8") as fp:
-        payload = json.load(fp)
-
-    models: List[ModelTemplate] = []
-    for item in payload.get("models", []):
-        tag = item.get("tag")
-        if not tag:
-            continue
-        pattern = item.get("pattern") or rf"\b{re.escape(tag)}\b"
-        models.append(ModelTemplate(tag=tag, pattern=pattern))
-    return models
+    editor = ModelTemplatesEditor(path)
+    templates: List[ModelTemplate] = []
+    for record in editor.iter_model_records():
+        templates.append(
+            ModelTemplate(
+                category=record.category,
+                brand=record.brand,
+                name=record.name,
+                pattern=record.pattern,
+                tags=list(record.tags),
+            )
+        )
+    return templates
 
 
 def load_tag_rules(path: str | Path) -> List[TagRule]:
@@ -284,25 +288,9 @@ def save_tags(path: str | Path, assignments: Iterable[TagAssignment]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _filter_auto_tags(matches: List[tuple[ModelTemplate, re.Match[str]]]) -> Set[str]:
-    filtered: Set[str] = set()
-    for template, match in matches:
-        candidate = template.tag
-        candidate_lower = candidate.lower()
-        has_longer = any(
-            other_template.tag.lower().startswith(candidate_lower)
-            and other_template.tag.lower() != candidate_lower
-            for other_template, _ in matches
-        )
-        if has_longer:
-            continue
-        filtered.add(candidate)
-    return filtered
-
-
 def _is_model_tag(tag: str, templates: Sequence[ModelTemplate]) -> bool:
     lowered = tag.lower()
-    if any(template.tag.lower() == lowered for template in templates):
+    if any(template.name.lower() == lowered for template in templates):
         return True
     return bool(MODEL_KEYWORDS.search(tag))
 
@@ -336,6 +324,37 @@ def _is_brand_tag(tag: str) -> bool:
         parts = stripped.split()
         return all(part[0].isupper() for part in parts if part)
     return stripped[0].isupper() and len(stripped) > 2
+
+
+def find_best_template_match(
+    product_name: str, templates: Sequence[ModelTemplate]
+) -> Optional[ModelTemplate]:
+    """Return the template that has the longest exact regex match."""
+
+    haystack = product_name or ""
+    best: tuple[int, ModelTemplate] | None = None
+    for template in templates:
+        length = template.match_length(haystack)
+        if length and (best is None or length > best[0]):
+            best = (length, template)
+    return best[1] if best else None
+
+
+def find_best_model_match(
+    product_name: str, models_list: Sequence[ModelTemplate]
+) -> Optional[ModelTemplate]:
+    """Compatibility wrapper that proxies to :func:`find_best_template_match`."""
+
+    return find_best_template_match(product_name, models_list)
+
+
+def match_models(product_name: str, templates: Sequence[ModelTemplate]) -> Set[str]:
+    """Return a set of tags derived from the best matching model template."""
+
+    template = find_best_template_match(product_name, templates)
+    if not template:
+        return set()
+    return {tag for tag in template.tags if tag}
 
 
 def determine_category(tags: Iterable[str]) -> str | None:
@@ -396,11 +415,7 @@ def apply_tags_to_products(
 
         name = product.name or ""
 
-        matches: List[tuple[ModelTemplate, re.Match[str]]] = []
-        for template in templates:
-            matches.extend((template, match) for match in template.iter_matches(name))
-
-        auto_tags = _filter_auto_tags(matches)
+        auto_tags = match_models(name, templates)
 
         rule_tags: Set[str] = set()
         for rule in rules:
@@ -431,9 +446,12 @@ __all__ = [
     "default_rules_payload",
     "default_templates_payload",
     "determine_category",
+    "find_best_model_match",
+    "find_best_template_match",
     "load_saved_tags",
     "load_tag_rules",
     "load_tag_templates",
+    "match_models",
     "make_assignment_key",
     "save_tags",
     "validate_tags",

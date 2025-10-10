@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, TypeV
 from .comparison_engine import ComparisonBuilder, ComparisonGroup, SupplierMatch
 from .comparison_state import ComparisonStateStore
 from .io import MissingRequiredColumnsError, PriceListExporter, PriceListImporter
+from .model_templates import ModelTemplatesEditor
 from .models import PriceList, Product
 from .repository import PriceListRepository
 from .search import ProductSearch
@@ -1050,6 +1051,432 @@ class JsonEditorDialog(tk.Toplevel):
         self.destroy()
 
 
+class ModelTemplatesDialog(tk.Toplevel):
+    """Visual editor for hierarchical model templates."""
+
+    def __init__(self, master: tk.Misc, *, manager: ModelTemplatesEditor) -> None:
+        super().__init__(master)
+        self.title("Шаблони моделей")
+        self.manager = manager
+        self.modified = False
+
+        self.selected_category: Optional[str] = None
+        self.selected_brand: Optional[str] = None
+        self.selected_model: Optional[str] = None
+
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        container = ttk.Frame(self, padding=12)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        left_column = ttk.Frame(container)
+        left_column.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        left_column.columnconfigure(0, weight=1)
+        left_column.rowconfigure(0, weight=1)
+        left_column.rowconfigure(1, weight=1)
+
+        categories_frame = ttk.Frame(left_column)
+        categories_frame.grid(row=0, column=0, sticky="nsew")
+        categories_frame.columnconfigure(0, weight=1)
+        categories_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(categories_frame, text="Категорії пристроїв").grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        self.category_list = tk.Listbox(
+            categories_frame, exportselection=False, height=8
+        )
+        self.category_list.grid(row=1, column=0, sticky="nsew")
+        category_scroll = ttk.Scrollbar(
+            categories_frame, orient=tk.VERTICAL, command=self.category_list.yview
+        )
+        category_scroll.grid(row=1, column=1, sticky="ns")
+        self.category_list.configure(yscrollcommand=category_scroll.set)
+
+        category_buttons = ttk.Frame(categories_frame)
+        category_buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        category_buttons.columnconfigure(0, weight=1)
+        self.category_label_var = tk.StringVar(value="Категорія: —")
+        ttk.Label(category_buttons, textvariable=self.category_label_var).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(category_buttons, text="Додати", command=self._add_category).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+        ttk.Button(
+            category_buttons, text="Перейменувати", command=self._rename_category
+        ).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(
+            category_buttons, text="Видалити", command=self._delete_category
+        ).grid(row=0, column=3, padx=(8, 0))
+
+        brands_frame = ttk.Frame(left_column)
+        brands_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        brands_frame.columnconfigure(0, weight=1)
+        brands_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(brands_frame, text="Бренди").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.brand_list = tk.Listbox(brands_frame, exportselection=False, height=8)
+        self.brand_list.grid(row=1, column=0, sticky="nsew")
+        brand_scroll = ttk.Scrollbar(
+            brands_frame, orient=tk.VERTICAL, command=self.brand_list.yview
+        )
+        brand_scroll.grid(row=1, column=1, sticky="ns")
+        self.brand_list.configure(yscrollcommand=brand_scroll.set)
+
+        brand_buttons = ttk.Frame(brands_frame)
+        brand_buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        brand_buttons.columnconfigure(0, weight=1)
+        self.brand_label_var = tk.StringVar(value="Бренд: —")
+        ttk.Label(brand_buttons, textvariable=self.brand_label_var).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(brand_buttons, text="Додати", command=self._add_brand).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+        ttk.Button(brand_buttons, text="Перейменувати", command=self._rename_brand).grid(
+            row=0, column=2, padx=(8, 0)
+        )
+        ttk.Button(brand_buttons, text="Видалити", command=self._delete_brand).grid(
+            row=0, column=3, padx=(8, 0)
+        )
+
+        models_frame = ttk.Frame(container)
+        models_frame.grid(row=0, column=1, sticky="nsew")
+        models_frame.columnconfigure(0, weight=1)
+        models_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(models_frame, text="Моделі").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.model_list = tk.Listbox(models_frame, exportselection=False, height=18)
+        self.model_list.grid(row=1, column=0, sticky="nsew")
+        model_scroll = ttk.Scrollbar(
+            models_frame, orient=tk.VERTICAL, command=self.model_list.yview
+        )
+        model_scroll.grid(row=1, column=1, sticky="ns")
+        self.model_list.configure(yscrollcommand=model_scroll.set)
+
+        model_buttons = ttk.Frame(models_frame)
+        model_buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        model_buttons.columnconfigure(0, weight=1)
+        self.model_label_var = tk.StringVar(value="Модель: —")
+        ttk.Label(model_buttons, textvariable=self.model_label_var).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(model_buttons, text="Додати", command=self._add_model).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+        ttk.Button(model_buttons, text="Перейменувати", command=self._rename_model).grid(
+            row=0, column=2, padx=(8, 0)
+        )
+        ttk.Button(model_buttons, text="Видалити", command=self._delete_model).grid(
+            row=0, column=3, padx=(8, 0)
+        )
+
+        footer = ttk.Frame(self, padding=(12, 0, 12, 12))
+        footer.grid(row=1, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(footer, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
+        ttk.Button(footer, text="Закрити", command=self._on_close).grid(
+            row=0, column=1, sticky="e"
+        )
+
+        self.category_list.bind("<<ListboxSelect>>", self._on_category_select)
+        self.brand_list.bind("<<ListboxSelect>>", self._on_brand_select)
+        self.model_list.bind("<<ListboxSelect>>", self._on_model_select)
+
+        self._refresh_categories()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _on_close(self) -> None:
+        self.grab_release()
+        self.destroy()
+
+    def _get_selected_value(self, widget: tk.Listbox) -> Optional[str]:
+        selection = widget.curselection()
+        if not selection:
+            return None
+        return widget.get(selection[0])
+
+    def _select_value(
+        self, widget: tk.Listbox, values: List[str], desired: Optional[str]
+    ) -> Optional[str]:
+        widget.selection_clear(0, tk.END)
+        if desired and desired in values:
+            index = values.index(desired)
+        elif values:
+            index = 0
+            desired = values[0]
+        else:
+            return None
+        widget.selection_set(index)
+        widget.activate(index)
+        widget.see(index)
+        return desired
+
+    def _refresh_categories(self, select: Optional[str] = None) -> None:
+        values = self.manager.list_categories()
+        self.category_list.delete(0, tk.END)
+        for value in values:
+            self.category_list.insert(tk.END, value)
+        self.selected_category = self._select_value(
+            self.category_list, values, select or self.selected_category
+        )
+        self._update_category_label()
+        self._refresh_brands()
+
+    def _refresh_brands(self, select: Optional[str] = None) -> None:
+        if not self.selected_category:
+            self.brand_list.delete(0, tk.END)
+            self.selected_brand = None
+            self._update_brand_label()
+            self._refresh_models()
+            return
+        values = self.manager.list_brands(self.selected_category)
+        self.brand_list.delete(0, tk.END)
+        for value in values:
+            self.brand_list.insert(tk.END, value)
+        self.selected_brand = self._select_value(
+            self.brand_list, values, select or self.selected_brand
+        )
+        self._update_brand_label()
+        self._refresh_models()
+
+    def _refresh_models(self, select: Optional[str] = None) -> None:
+        if not (self.selected_category and self.selected_brand):
+            self.model_list.delete(0, tk.END)
+            self.selected_model = None
+            self._update_model_label()
+            return
+        values = self.manager.list_models(self.selected_category, self.selected_brand)
+        self.model_list.delete(0, tk.END)
+        for value in values:
+            self.model_list.insert(tk.END, value)
+        self.selected_model = self._select_value(
+            self.model_list, values, select or self.selected_model
+        )
+        self._update_model_label()
+
+    def _update_category_label(self) -> None:
+        value = self.selected_category or "—"
+        self.category_label_var.set(f"Категорія: {value}")
+
+    def _update_brand_label(self) -> None:
+        value = self.selected_brand or "—"
+        self.brand_label_var.set(f"Бренд: {value}")
+
+    def _update_model_label(self) -> None:
+        value = self.selected_model or "—"
+        self.model_label_var.set(f"Модель: {value}")
+
+    def _mark_modified(self) -> None:
+        self.modified = True
+        self.status_var.set("✅ Шаблони оновлено")
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
+    def _on_category_select(self, _: tk.Event[tk.Misc]) -> None:  # type: ignore[name-defined]
+        selected = self._get_selected_value(self.category_list)
+        if selected == self.selected_category:
+            return
+        self.selected_category = selected
+        self._update_category_label()
+        self._refresh_brands()
+
+    def _on_brand_select(self, _: tk.Event[tk.Misc]) -> None:  # type: ignore[name-defined]
+        selected = self._get_selected_value(self.brand_list)
+        if selected == self.selected_brand:
+            return
+        self.selected_brand = selected
+        self._update_brand_label()
+        self._refresh_models()
+
+    def _on_model_select(self, _: tk.Event[tk.Misc]) -> None:  # type: ignore[name-defined]
+        selected = self._get_selected_value(self.model_list)
+        if selected == self.selected_model:
+            return
+        self.selected_model = selected
+        self._update_model_label()
+
+    # ------------------------------------------------------------------
+    # Mutations
+    # ------------------------------------------------------------------
+    def _add_category(self) -> None:
+        name = simpledialog.askstring("Нова категорія", "Введіть назву категорії:", parent=self)
+        if not name:
+            return
+        try:
+            self.manager.add_category(name)
+            self.manager.save_data()
+        except ValueError as exc:
+            messagebox.showerror("Категорії", str(exc), parent=self)
+            return
+        self._mark_modified()
+        self._refresh_categories(select=name.strip())
+
+    def _rename_category(self) -> None:
+        if not self.selected_category:
+            messagebox.showwarning("Категорії", "Оберіть категорію для перейменування.", parent=self)
+            return
+        new_name = simpledialog.askstring(
+            "Перейменувати категорію",
+            "Введіть нову назву:",
+            initialvalue=self.selected_category,
+            parent=self,
+        )
+        if not new_name or new_name.strip() == self.selected_category:
+            return
+        try:
+            self.manager.rename_category(self.selected_category, new_name)
+            self.manager.save_data()
+        except ValueError as exc:
+            messagebox.showerror("Категорії", str(exc), parent=self)
+            return
+        self._mark_modified()
+        self.selected_category = new_name.strip()
+        self._refresh_categories(select=self.selected_category)
+
+    def _delete_category(self) -> None:
+        if not self.selected_category:
+            messagebox.showwarning("Категорії", "Оберіть категорію для видалення.", parent=self)
+            return
+        if not messagebox.askyesno(
+            "Категорії",
+            f"Видалити категорію '{self.selected_category}' разом з усіма брендами?",
+            parent=self,
+        ):
+            return
+        self.manager.delete_category(self.selected_category)
+        self.manager.save_data()
+        self._mark_modified()
+        self.selected_category = None
+        self._refresh_categories()
+
+    def _add_brand(self) -> None:
+        if not self.selected_category:
+            messagebox.showwarning("Бренди", "Спочатку оберіть категорію.", parent=self)
+            return
+        name = simpledialog.askstring("Новий бренд", "Введіть назву бренду:", parent=self)
+        if not name:
+            return
+        try:
+            self.manager.add_brand(self.selected_category, name)
+            self.manager.save_data()
+        except ValueError as exc:
+            messagebox.showerror("Бренди", str(exc), parent=self)
+            return
+        self._mark_modified()
+        self.selected_brand = name.strip()
+        self._refresh_brands(select=self.selected_brand)
+
+    def _rename_brand(self) -> None:
+        if not (self.selected_category and self.selected_brand):
+            messagebox.showwarning("Бренди", "Оберіть бренд для перейменування.", parent=self)
+            return
+        new_name = simpledialog.askstring(
+            "Перейменувати бренд",
+            "Введіть нову назву:",
+            initialvalue=self.selected_brand,
+            parent=self,
+        )
+        if not new_name or new_name.strip() == self.selected_brand:
+            return
+        try:
+            self.manager.rename_brand(self.selected_category, self.selected_brand, new_name)
+            self.manager.save_data()
+        except ValueError as exc:
+            messagebox.showerror("Бренди", str(exc), parent=self)
+            return
+        self._mark_modified()
+        self.selected_brand = new_name.strip()
+        self._refresh_brands(select=self.selected_brand)
+
+    def _delete_brand(self) -> None:
+        if not (self.selected_category and self.selected_brand):
+            messagebox.showwarning("Бренди", "Оберіть бренд для видалення.", parent=self)
+            return
+        if not messagebox.askyesno(
+            "Бренди",
+            f"Видалити бренд '{self.selected_brand}' разом з моделями?",
+            parent=self,
+        ):
+            return
+        self.manager.delete_brand(self.selected_category, self.selected_brand)
+        self.manager.save_data()
+        self._mark_modified()
+        self.selected_brand = None
+        self._refresh_brands()
+
+    def _add_model(self) -> None:
+        if not (self.selected_category and self.selected_brand):
+            messagebox.showwarning("Моделі", "Оберіть бренд для додавання моделі.", parent=self)
+            return
+        name = simpledialog.askstring("Нова модель", "Введіть назву моделі:", parent=self)
+        if not name:
+            return
+        try:
+            self.manager.add_model(self.selected_category, self.selected_brand, name)
+            self.manager.save_data()
+        except ValueError as exc:
+            messagebox.showerror("Моделі", str(exc), parent=self)
+            return
+        self._mark_modified()
+        self.selected_model = name.strip()
+        self._refresh_models(select=self.selected_model)
+
+    def _rename_model(self) -> None:
+        if not (self.selected_category and self.selected_brand and self.selected_model):
+            messagebox.showwarning("Моделі", "Оберіть модель для перейменування.", parent=self)
+            return
+        new_name = simpledialog.askstring(
+            "Перейменувати модель",
+            "Введіть нову назву:",
+            initialvalue=self.selected_model,
+            parent=self,
+        )
+        if not new_name or new_name.strip() == self.selected_model:
+            return
+        try:
+            self.manager.rename_model(
+                self.selected_category, self.selected_brand, self.selected_model, new_name
+            )
+            self.manager.save_data()
+        except ValueError as exc:
+            messagebox.showerror("Моделі", str(exc), parent=self)
+            return
+        self._mark_modified()
+        self.selected_model = new_name.strip()
+        self._refresh_models(select=self.selected_model)
+
+    def _delete_model(self) -> None:
+        if not (self.selected_category and self.selected_brand and self.selected_model):
+            messagebox.showwarning("Моделі", "Оберіть модель для видалення.", parent=self)
+            return
+        if not messagebox.askyesno(
+            "Моделі",
+            f"Видалити модель '{self.selected_model}'?",
+            parent=self,
+        ):
+            return
+        self.manager.delete_model(
+            self.selected_category, self.selected_brand, self.selected_model
+        )
+        self.manager.save_data()
+        self._mark_modified()
+        self.selected_model = None
+        self._refresh_models()
+
 _CONDITION_PATTERN = re.compile(
     r"REGEXMATCH\s*\(\s*\{\{\s*name\s*\}\}\s*,\s*(?P<literal>(\"(?:\\.|[^\"])*\")|('(?:\\.|[^'])*'))\s*\)",
     re.IGNORECASE,
@@ -1514,11 +1941,11 @@ class TagsTab(ttk.Frame):
         self.get_products = get_products
         self.on_save = on_save
 
-        self.templates_path = self.data_dir / "tag_templates.json"
+        self.models_path = self.data_dir / "models.json"
         self.rules_path = self.data_dir / "tag_rules.json"
         self.assignments_path = self.data_dir / "tag_assignments.json"
 
-        self.templates = tags_assignment.load_tag_templates(self.templates_path)
+        self.templates = tags_assignment.load_tag_templates(self.models_path)
         self.rules = tags_assignment.load_tag_rules(self.rules_path)
         self.saved_map = tags_assignment.load_saved_tags(self.assignments_path)
 
@@ -1730,18 +2157,14 @@ class TagsTab(ttk.Frame):
         messagebox.showinfo("Мітки", "Теги успішно збережено.")
 
     def _edit_templates(self) -> None:
-        dialog = JsonEditorDialog(
-            self,
-            path=self.templates_path,
-            title="Шаблони моделей",
-            default_payload=tags_assignment.default_templates_payload,
-        )
+        manager = ModelTemplatesEditor(self.models_path)
+        dialog = ModelTemplatesDialog(self, manager=manager)
         self.wait_window(dialog)
-        if dialog.result:
-            self.templates = tags_assignment.load_tag_templates(self.templates_path)
+        if dialog.modified:
+            self.templates = tags_assignment.load_tag_templates(self.models_path)
             messagebox.showinfo(
                 "Мітки",
-                "Шаблони моделей оновлено. Натисніть 'Оновити мітки' для перерахунку.",
+                "✅ Шаблони оновлено. Натисніть 'Оновити мітки' для перерахунку.",
             )
 
     def _edit_rules(self) -> None:
