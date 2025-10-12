@@ -9,6 +9,7 @@ import threading
 import tkinter as tk
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import (
@@ -143,6 +144,7 @@ class PriceCompareApp(tk.Tk):
 
         self._create_menu()
         self._create_widgets()
+        self._setup_edit_bindings()
         self.refresh_data(mark_comparisons_stale=False)
 
     # ------------------------------------------------------------------
@@ -175,6 +177,139 @@ class PriceCompareApp(tk.Tk):
             return
         state = tk.NORMAL if enabled else tk.DISABLED
         self._catalog_links_button.config(state=state)
+
+    # ------------------------------------------------------------------
+    # Clipboard helpers
+    # ------------------------------------------------------------------
+    def _setup_edit_bindings(self) -> None:
+        self._clipboard_menu = tk.Menu(self, tearoff=False)
+        self._clipboard_target: tk.Widget | None = None
+
+        self._clipboard_menu.add_command(
+            label="Вирізати",
+            command=partial(self._handle_menu_edit, "<<Cut>>"),
+        )
+        self._clipboard_menu.add_command(
+            label="Копіювати",
+            command=partial(self._handle_menu_edit, "<<Copy>>"),
+        )
+        self._clipboard_menu.add_command(
+            label="Вставити",
+            command=partial(self._handle_menu_edit, "<<Paste>>"),
+        )
+        self._clipboard_menu.add_separator()
+        self._clipboard_menu.add_command(
+            label="Виділити все",
+            command=partial(self._handle_menu_edit, "<<SelectAll>>"),
+        )
+
+        for class_name in ("Text", "Entry", "TEntry", "TCombobox"):
+            self.bind_class(
+                class_name,
+                "<Control-c>",
+                lambda event, seq="<<Copy>>": self._on_edit_shortcut(event, seq),
+                add="+",
+            )
+            self.bind_class(
+                class_name,
+                "<Control-x>",
+                lambda event, seq="<<Cut>>": self._on_edit_shortcut(event, seq),
+                add="+",
+            )
+            self.bind_class(
+                class_name,
+                "<Control-v>",
+                lambda event, seq="<<Paste>>": self._on_edit_shortcut(event, seq),
+                add="+",
+            )
+            self.bind_class(
+                class_name,
+                "<Control-a>",
+                lambda event, seq="<<SelectAll>>": self._on_edit_shortcut(event, seq),
+                add="+",
+            )
+            self.bind_class(
+                class_name,
+                "<Button-3>",
+                self._show_clipboard_menu,
+                add="+",
+            )
+
+    def _supports_edit_commands(self, widget: tk.Widget | None) -> bool:
+        if widget is None:
+            return False
+        widget_class = widget.winfo_class()
+        if widget_class in {"Entry", "TEntry", "Text", "TCombobox"}:
+            return True
+        return isinstance(widget, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox))
+
+    def _widget_allows_modification(self, widget: tk.Widget) -> bool:
+        if getattr(widget, "_read_only", False):
+            return False
+        try:
+            state = str(widget.cget("state"))
+        except tk.TclError:
+            state = "normal"
+        if state.lower() in {"disabled", "readonly"}:
+            return False
+        if isinstance(widget, ttk.Entry):
+            try:
+                if widget.instate(("readonly",)):
+                    return False
+            except tk.TclError:
+                pass
+        if isinstance(widget, ttk.Combobox):
+            try:
+                if widget.instate(("readonly",)):
+                    return False
+            except tk.TclError:
+                pass
+        return True
+
+    def _on_edit_shortcut(self, event: tk.Event[tk.Misc], sequence: str) -> str | None:  # type: ignore[name-defined]
+        widget = event.widget
+        if not self._supports_edit_commands(widget):
+            return None
+        if sequence in {"<<Cut>>", "<<Paste>>"} and widget and not self._widget_allows_modification(widget):
+            return "break"
+        try:
+            widget.event_generate(sequence)
+        except tk.TclError:
+            return None
+        return "break"
+
+    def _handle_menu_edit(self, sequence: str) -> None:
+        widget = self._clipboard_target
+        if widget is None or not self._supports_edit_commands(widget):
+            return
+        if sequence in {"<<Cut>>", "<<Paste>>"} and not self._widget_allows_modification(widget):
+            return
+        try:
+            widget.event_generate(sequence)
+        except tk.TclError:
+            pass
+
+    def _show_clipboard_menu(self, event: tk.Event[tk.Misc]) -> str | None:  # type: ignore[name-defined]
+        widget = event.widget
+        if not self._supports_edit_commands(widget):
+            return None
+        self._clipboard_target = widget
+        can_modify = self._widget_allows_modification(widget)
+        try:
+            has_selection = bool(widget.selection_get())
+        except Exception:
+            has_selection = False
+        try:
+            self._clipboard_menu.entryconfigure("Вирізати", state=tk.NORMAL if (can_modify and has_selection) else tk.DISABLED)
+            self._clipboard_menu.entryconfigure("Копіювати", state=tk.NORMAL if has_selection else tk.DISABLED)
+            self._clipboard_menu.entryconfigure("Вставити", state=tk.NORMAL if can_modify else tk.DISABLED)
+        except tk.TclError:
+            pass
+        try:
+            self._clipboard_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._clipboard_menu.grab_release()
+        return "break"
 
     def _mark_comparisons_stale(self) -> None:
         if hasattr(self, "comparison_board"):
@@ -2392,12 +2527,34 @@ class TagSelectionDialog(tk.Toplevel):
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
-        ttk.Label(
-            self,
-            text=f"{assignment.product.sku or ''} — {assignment.product.name}",
-            wraplength=520,
-            justify=tk.LEFT,
-        ).pack(fill=tk.X, padx=12, pady=(12, 4))
+        header = ttk.Frame(self)
+        header.pack(fill=tk.X, padx=12, pady=(12, 4))
+
+        sku_text = assignment.product.sku or "—"
+        ttk.Label(header, text=f"SKU: {sku_text}", justify=tk.LEFT).pack(anchor=tk.W)
+
+        ttk.Label(header, text="Назва товару:", justify=tk.LEFT).pack(
+            anchor=tk.W, pady=(6, 0)
+        )
+
+        name_value = assignment.product.name or ""
+        text_height = min(6, max(2, name_value.count("\n") + 1))
+
+        self.name_display = tk.Text(
+            header,
+            height=text_height,
+            wrap=tk.WORD,
+            padx=4,
+            pady=4,
+            undo=False,
+        )
+        self.name_display.insert("1.0", name_value)
+        self.name_display.configure(cursor="arrow")
+        self.name_display._read_only = True  # type: ignore[attr-defined]
+        self.name_display.bind("<Key>", self._on_name_key_press)
+        for sequence in ("<<Cut>>", "<<Paste>>", "<<Clear>>"):
+            self.name_display.bind(sequence, lambda _event: "break")
+        self.name_display.pack(fill=tk.X, pady=(0, 4))
 
         ttk.Label(
             self,
@@ -2448,6 +2605,27 @@ class TagSelectionDialog(tk.Toplevel):
         ttk.Button(controls, text="Готово", command=self._on_save).pack(
             side=tk.RIGHT, padx=(0, 8)
         )
+
+    def _on_name_key_press(self, event: tk.Event[tk.Misc]) -> str | None:  # type: ignore[name-defined]
+        if event.state & 0x4:  # Control modifier
+            if event.keysym.lower() in {"c", "a"}:
+                return None
+        if event.keysym in {
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "Home",
+            "End",
+            "Prior",
+            "Next",
+            "Shift_L",
+            "Shift_R",
+            "Control_L",
+            "Control_R",
+        }:
+            return None
+        return "break"
 
     def _clear(self) -> None:
         for var in self._tag_vars.values():
@@ -3463,13 +3641,15 @@ class ComparisonBoard(ttk.Frame):
                 continue
             self.state_store.set_status(row.group_id, row.match_id, "confirmed")
             self._selection[row_id] = False
+            row.status = "confirmed"
             changed = True
         if changed:
             self.state_store.save()
-            self.refresh()
+            self._apply_filters()
 
     def _remove_selected(self) -> None:
         changed = False
+        removed_ids: List[str] = []
         for row_id, selected in list(self._selection.items()):
             if not selected:
                 continue
@@ -3478,10 +3658,16 @@ class ComparisonBoard(ttk.Frame):
                 continue
             self.state_store.set_status(row.group_id, row.match_id, "removed")
             self._selection.pop(row_id, None)
+            self._rows.pop(row_id, None)
+            removed_ids.append(row_id)
             changed = True
         if changed:
+            if removed_ids:
+                self._ordered_rows = [
+                    row for row in self._ordered_rows if row.row_id not in removed_ids
+                ]
             self.state_store.save()
-            self.refresh()
+            self._apply_filters()
 
     def _on_reload_clicked(self) -> None:
         if self.on_reload:
