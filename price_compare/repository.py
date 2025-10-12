@@ -112,6 +112,24 @@ class PriceListRepository:
         if path.exists():
             path.unlink()
 
+    def rename(self, old_supplier: str, new_supplier: str) -> None:
+        old_path = self._file_for_supplier(old_supplier)
+        if not old_path.exists():
+            raise FileNotFoundError(
+                f"No price list stored for supplier '{old_supplier}'."
+            )
+        new_path = self._file_for_supplier(new_supplier)
+        if new_path.exists():
+            raise FileExistsError(
+                f"A price list already exists for supplier '{new_supplier}'."
+            )
+        old_path.rename(new_path)
+        payload = self._load_payload(new_path)
+        if payload and self._is_price_list_payload(payload):
+            payload["supplier"] = new_supplier
+            with new_path.open("w", encoding="utf-8") as fp:
+                json.dump(payload, fp, indent=2, ensure_ascii=False)
+
     def clear(self) -> None:
         for supplier in self.list_suppliers():
             self.delete(supplier)
