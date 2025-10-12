@@ -3463,13 +3463,15 @@ class ComparisonBoard(ttk.Frame):
                 continue
             self.state_store.set_status(row.group_id, row.match_id, "confirmed")
             self._selection[row_id] = False
+            row.status = "confirmed"
             changed = True
         if changed:
             self.state_store.save()
-            self.refresh()
+            self._apply_filters()
 
     def _remove_selected(self) -> None:
         changed = False
+        removed_ids: List[str] = []
         for row_id, selected in list(self._selection.items()):
             if not selected:
                 continue
@@ -3478,10 +3480,16 @@ class ComparisonBoard(ttk.Frame):
                 continue
             self.state_store.set_status(row.group_id, row.match_id, "removed")
             self._selection.pop(row_id, None)
+            self._rows.pop(row_id, None)
+            removed_ids.append(row_id)
             changed = True
         if changed:
+            if removed_ids:
+                self._ordered_rows = [
+                    row for row in self._ordered_rows if row.row_id not in removed_ids
+                ]
             self.state_store.save()
-            self.refresh()
+            self._apply_filters()
 
     def _on_reload_clicked(self) -> None:
         if self.on_reload:
