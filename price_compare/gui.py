@@ -7,6 +7,7 @@ import json
 import re
 import threading
 import tkinter as tk
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -58,6 +59,15 @@ def _center_dialog(window: tk.Toplevel, master: tk.Misc) -> str:
     x = master.winfo_rootx() + max((master_width - width) // 2, 0)
     y = master.winfo_rooty() + max((master_height - height) // 2, 0)
     return f"+{x}+{y}"
+
+
+def _plural_form(count: int, forms: tuple[str, str, str]) -> str:
+    count = abs(int(count))
+    if count % 10 == 1 and count % 100 != 11:
+        return forms[0]
+    if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
+        return forms[1]
+    return forms[2]
 
 
 class ProgressDialog(tk.Toplevel):
@@ -129,6 +139,7 @@ class PriceCompareApp(tk.Tk):
         self._store_price_path = self.repository.data_dir / STORE_PRICE_FILENAME
         self._comparison_refresh_in_progress = False
         self._catalog_links_button: ttk.Button | None = None
+        self._comparison_subset: Set[str] | None = None
 
         self._create_menu()
         self._create_widgets()
@@ -278,16 +289,13 @@ class PriceCompareApp(tk.Tk):
         toolbar = ttk.Frame(self.catalog_tab)
         toolbar.pack(fill=tk.X, padx=8, pady=4)
 
-        ttk.Button(toolbar, text="Імпорт прайсу", command=self._import_price_list).pack(
+        ttk.Button(toolbar, text="Імпорт прайсу", command=self._handle_import_price).pack(
             side=tk.LEFT
         )
-        ttk.Button(toolbar, text="Експорт постачальника", command=self._export_supplier).pack(
+        ttk.Button(toolbar, text="Експорт прайсу", command=self._export_selected_prices).pack(
             side=tk.LEFT, padx=(8, 0)
         )
-        ttk.Button(toolbar, text="Видалити", command=self._delete_supplier).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
-        ttk.Button(toolbar, text="Оновити дані", command=self.refresh_data).pack(
+        ttk.Button(toolbar, text="Видалити", command=self._delete_selected_prices).pack(
             side=tk.LEFT, padx=(8, 0)
         )
         self._catalog_links_button = ttk.Button(
@@ -297,43 +305,64 @@ class PriceCompareApp(tk.Tk):
         )
         self._catalog_links_button.pack(side=tk.LEFT, padx=(8, 0))
 
-        body = ttk.Panedwindow(self.catalog_tab, orient=tk.HORIZONTAL)
-        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-
-        left_frame = ttk.Frame(body)
-        right_frame = ttk.Frame(body)
-        body.add(left_frame, weight=1)
-        body.add(right_frame, weight=3)
-
-        ttk.Label(left_frame, text="Постачальники").pack(anchor=tk.W)
-        self.suppliers_list = tk.Listbox(left_frame, exportselection=False)
-        self.suppliers_list.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
-        self.suppliers_list.bind("<<ListboxSelect>>", lambda _event: self._show_supplier_products())
-
-        ttk.Label(right_frame, text="Товари постачальника").pack(anchor=tk.W)
-        columns = ("sku", "name", "price", "tags")
-        self.products_tree = ttk.Treeview(
-            right_frame,
+        columns = ("actions", "updated")
+        self.catalog_tree = ttk.Treeview(
+            self.catalog_tab,
             columns=columns,
-            show="headings",
-            selectmode="browse",
+            show="tree headings",
+            selectmode="extended",
         )
-        headings = {
-            "sku": "SKU",
-            "name": "Назва",
-            "price": "Ціна",
-            "tags": "Теги",
-        }
-        widths = {
-            "sku": 140,
-            "name": 360,
-            "price": 120,
-            "tags": 220,
-        }
-        for column in columns:
-            self.products_tree.heading(column, text=headings[column])
-            self.products_tree.column(column, width=widths[column], anchor=tk.W)
-        self.products_tree.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        self.catalog_tree.heading("#0", text="Постачальники / Прайси", anchor=tk.W)
+        self.catalog_tree.heading("actions", text="Дії", anchor=tk.CENTER)
+        self.catalog_tree.heading("updated", text="Оновлено", anchor=tk.W)
+        self.catalog_tree.column("#0", width=420, anchor=tk.W, stretch=True)
+        self.catalog_tree.column("actions", width=80, anchor=tk.CENTER, stretch=False)
+        self.catalog_tree.column("updated", width=180, anchor=tk.W, stretch=False)
+        self.catalog_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
+        self.catalog_tree.tag_configure("placeholder", foreground="#888888")
+        self.catalog_tree.bind("<Button-1>", self._on_catalog_tree_click, add="+")
+        self.catalog_tree.bind("<Button-3>", self._on_catalog_context_request)
+        self.catalog_tree.bind("<Delete>", lambda _event: self._delete_selected_prices())
+        self.catalog_tree.bind("<Insert>", lambda _event: self._add_supplier())
+        self.catalog_tree.bind("<Shift-Z>", lambda _event: self._rename_supplier())
+        self.catalog_tree.bind("<Shift-z>", lambda _event: self._rename_supplier())
+        self.bind_all("<Control-r>", lambda _event: self._start_comparison_refresh())
+
+        bottom_bar = ttk.Frame(self.catalog_tab)
+        bottom_bar.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Button(bottom_bar, text="+", width=4, command=self._add_supplier).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(bottom_bar, text="-", width=4, command=self._remove_supplier).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(bottom_bar, text="✎", width=4, command=self._rename_supplier).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+
+        self._supplier_menu = tk.Menu(self, tearoff=False)
+        self._supplier_menu.add_command(
+            label="Додати прайс", command=lambda: self._handle_import_price(context="supplier")
+        )
+        self._supplier_menu.add_command(
+            label="Імпорт прайсу", command=lambda: self._handle_import_price(context="supplier")
+        )
+        self._supplier_menu.add_command(
+            label="Перейменувати", command=self._rename_supplier
+        )
+        self._supplier_menu.add_command(
+            label="Видалити постачальника", command=self._remove_supplier
+        )
+
+        self._price_menu = tk.Menu(self, tearoff=False)
+        self._price_menu.add_command(label="Оновити файл…", command=self._refresh_price_file)
+        self._price_menu.add_command(
+            label="Налаштувати автооновлення…", command=self._configure_auto_update
+        )
+        self._price_menu.add_command(label="Експорт", command=self._export_selected_prices)
+        self._price_menu.add_command(label="Видалити", command=self._delete_selected_prices)
+
+        self._catalog_tree_items: Dict[str, dict] = {}
 
     def _build_search_tab(self) -> None:
         control_frame = ttk.LabelFrame(self.search_tab, text="Параметри пошуку")
@@ -414,7 +443,7 @@ class PriceCompareApp(tk.Tk):
         self.comparison_board = ComparisonBoard(
             self.compare_tab,
             get_store_products=self._current_store_products,
-            get_supplier_lists=lambda: list(self.price_lists.values()),
+            get_supplier_lists=self._comparison_supplier_lists,
             state_store=self.comparison_state,
             on_reload=self._start_comparison_refresh,
         )
@@ -428,6 +457,14 @@ class PriceCompareApp(tk.Tk):
             return
         if self._comparison_refresh_in_progress:
             return
+
+        subset: Set[str] | None = None
+        if hasattr(self, "catalog_tree"):
+            selected_prices = self._selected_price_nodes()
+            suppliers = {meta.get("supplier") for meta in selected_prices if meta.get("supplier")}
+            if suppliers:
+                subset = {str(name) for name in suppliers if name}
+        self._comparison_subset = subset
 
         if not self.price_lists and not self.store_price_list:
             messagebox.showinfo(
@@ -470,9 +507,9 @@ class PriceCompareApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Помилка", f"Не вдалося завантажити дані: {exc}")
             self.price_lists = {}
-        self._populate_suppliers()
+        self._comparison_subset = None
+        self._populate_catalog_tree()
         self._populate_supplier_dropdown()
-        self._show_supplier_products()
         self._load_store_price_from_disk()
         self._update_store_tree()
         has_any_prices = bool(self.price_lists or self.store_price_list)
@@ -486,50 +523,275 @@ class PriceCompareApp(tk.Tk):
             if not mark_comparisons_stale:
                 self.comparison_board.refresh()
 
-    def _populate_suppliers(self) -> None:
-        self.suppliers_list.delete(0, tk.END)
-        for supplier in sorted(self.price_lists):
-            price_list = self.price_lists[supplier]
-            count = len(price_list.products)
-            self.suppliers_list.insert(tk.END, f"{supplier} ({count})")
-
     def _populate_supplier_dropdown(self) -> None:
         suppliers = sorted(self.price_lists)
         self.search_supplier["values"] = ["Усі"] + suppliers
         self.search_supplier.set("Усі")
 
-    def _selected_supplier(self) -> str | None:
-        selection = self.suppliers_list.curselection()
-        if not selection:
+    def _comparison_supplier_lists(self) -> Sequence[PriceList]:
+        if self._comparison_subset:
+            return [
+                self.price_lists[name]
+                for name in self._comparison_subset
+                if name in self.price_lists
+            ]
+        return list(self.price_lists.values())
+
+    def _format_relative_time(self, raw: str | None) -> str:
+        if not raw:
+            return "—"
+        try:
+            normalized = raw.replace("Z", "+00:00")
+            moment = datetime.fromisoformat(normalized)
+        except ValueError:
+            return raw
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        delta = now - moment
+        seconds = int(max(delta.total_seconds(), 0))
+        if seconds < 60:
+            return "щойно"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes} хв тому"
+        hours = minutes // 60
+        minutes = minutes % 60
+        if hours < 24:
+            parts = [f"{hours} год"]
+            if minutes:
+                parts.append(f"{minutes} хв")
+            return " ".join(parts) + " тому"
+        days = hours // 24
+        if days < 30:
+            form = _plural_form(days, ("день", "дні", "днів"))
+            return f"{days} {form} тому"
+        months = days // 30
+        if months < 12:
+            form = _plural_form(months, ("місяць", "місяці", "місяців"))
+            return f"{months} {form} тому"
+        years = months // 12
+        form = _plural_form(years, ("рік", "роки", "років"))
+        return f"{years} {form} тому"
+
+    def _catalog_item_key(self, item_id: str) -> tuple[str, str, str | None] | None:
+        meta = self._catalog_tree_items.get(item_id)
+        if not meta:
             return None
-        index = selection[0]
-        item = self.suppliers_list.get(index)
-        return item.split(" (")[0]
-
-    def _show_supplier_products(self) -> None:
-        for item in self.products_tree.get_children():
-            self.products_tree.delete(item)
-
-        supplier = self._selected_supplier()
+        kind = meta.get("type")
+        supplier = meta.get("supplier")
         if not supplier:
-            return
+            return None
+        if kind == "supplier":
+            return ("supplier", supplier, None)
+        if kind == "price":
+            return ("price", supplier, meta.get("price_id") or "default")
+        return None
 
-        price_list = self.price_lists.get(supplier)
-        if not price_list:
-            return
+    def _extract_price_entries(self, price_list: PriceList) -> List[Dict[str, object]]:
+        metadata = dict(price_list.metadata or {})
+        entries: List[Dict[str, object]] = []
+        prices_meta = metadata.get("prices")
+        if isinstance(prices_meta, list):
+            for entry in prices_meta:
+                if not isinstance(entry, dict):
+                    continue
+                price_id = str(entry.get("id") or entry.get("name") or "default")
+                name = str(entry.get("name") or "Прайс")
+                updated_at = entry.get("updated_at")
+                actions = "↻  ⚙"
+                entries.append(
+                    {
+                        "id": price_id,
+                        "name": name,
+                        "updated_at": updated_at,
+                        "updated_label": self._format_relative_time(str(updated_at) if updated_at else None),
+                        "auto_update": entry.get("auto_update", {}),
+                        "actions": actions,
+                    }
+                )
+        if not entries and (
+            price_list.products
+            or metadata.get("price_name")
+            or metadata.get("updated_at")
+        ):
+            updated_at = metadata.get("updated_at")
+            name = metadata.get("price_name") or "Прайс"
+            entries.append(
+                {
+                    "id": "default",
+                    "name": str(name),
+                    "updated_at": updated_at,
+                    "updated_label": self._format_relative_time(
+                        str(updated_at) if updated_at else None
+                    ),
+                    "auto_update": metadata.get("auto_update", {}),
+                    "actions": "↻  ⚙",
+                }
+            )
+        return entries
 
-        for product in price_list.products:
-            tags = ", ".join(sorted(product.tags))
-            self.products_tree.insert(
+    def _populate_catalog_tree(self) -> None:
+        if not hasattr(self, "catalog_tree"):
+            return
+        expanded: Dict[str, bool] = {}
+        selected_keys: Set[tuple[str, str, str | None]] = set()
+        for item_id in self.catalog_tree.get_children(""):
+            key = self._catalog_item_key(item_id)
+            if key and key[0] == "supplier":
+                expanded[key[1]] = bool(self.catalog_tree.item(item_id, "open"))
+        for item_id in self.catalog_tree.selection():
+            key = self._catalog_item_key(item_id)
+            if key:
+                selected_keys.add(key)
+
+        for item in self.catalog_tree.get_children(""):
+            self.catalog_tree.delete(item)
+        self._catalog_tree_items.clear()
+
+        for supplier in sorted(self.price_lists):
+            price_list = self.price_lists[supplier]
+            supplier_item = self.catalog_tree.insert(
                 "",
                 tk.END,
-                values=(product.sku, product.name, _format_price(product), tags),
+                text=supplier,
+                open=expanded.get(supplier, True),
             )
+            self._catalog_tree_items[supplier_item] = {"type": "supplier", "supplier": supplier}
+            price_entries = self._extract_price_entries(price_list)
+            has_price = False
+            for entry in price_entries:
+                name = entry["name"]
+                updated_label = entry["updated_label"]
+                actions = entry["actions"]
+                price_item = self.catalog_tree.insert(
+                    supplier_item,
+                    tk.END,
+                    text=name,
+                    values=(actions, updated_label),
+                )
+                self._catalog_tree_items[price_item] = {
+                    "type": "price",
+                    "supplier": supplier,
+                    "price_id": entry["id"],
+                    "name": name,
+                    "auto_update": entry.get("auto_update") or {},
+                }
+                if ("price", supplier, entry["id"]) in selected_keys:
+                    self.catalog_tree.selection_add(price_item)
+                has_price = True
+            if not has_price:
+                placeholder = self.catalog_tree.insert(
+                    supplier_item,
+                    tk.END,
+                    text="(немає прайсів)",
+                    values=("", ""),
+                    tags=("placeholder",),
+                )
+                self._catalog_tree_items[placeholder] = {
+                    "type": "placeholder",
+                    "supplier": supplier,
+                }
+            if ("supplier", supplier, None) in selected_keys:
+                self.catalog_tree.selection_add(supplier_item)
+
+    def _selected_supplier_from_tree(self) -> str | None:
+        if not hasattr(self, "catalog_tree"):
+            return None
+        selection = self.catalog_tree.selection()
+        if not selection:
+            return None
+        first = selection[0]
+        meta = self._catalog_tree_items.get(first)
+        if not meta:
+            return None
+        if meta.get("type") in {"supplier", "placeholder", "price"}:
+            return meta.get("supplier")
+        return None
+
+    def _selected_price_nodes(self) -> List[Dict[str, object]]:
+        if not hasattr(self, "catalog_tree"):
+            return []
+        seen: Set[tuple[str, str]] = set()
+        results: List[Dict[str, object]] = []
+        for item_id in self.catalog_tree.selection():
+            meta = self._catalog_tree_items.get(item_id)
+            if not meta:
+                continue
+            if meta.get("type") == "price":
+                key = (meta.get("supplier"), meta.get("price_id"))
+                if key not in seen:
+                    seen.add(key)
+                    results.append(meta)
+            elif meta.get("type") == "supplier":
+                for child in self.catalog_tree.get_children(item_id):
+                    child_meta = self._catalog_tree_items.get(child)
+                    if not child_meta or child_meta.get("type") != "price":
+                        continue
+                    key = (child_meta.get("supplier"), child_meta.get("price_id"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append(child_meta)
+        return results
+
+    def _handle_import_price(self, context: str | None = None) -> None:
+        supplier = self._selected_supplier_from_tree()
+        if not supplier and context == "supplier":
+            messagebox.showwarning("Імпорт прайсу", "Оберіть постачальника у списку.")
+            return
+        if not supplier:
+            supplier = simpledialog.askstring("Постачальник", "Назва постачальника:")
+            if not supplier:
+                messagebox.showinfo("Імпорт перервано", "Назва постачальника не вказана.")
+                return
+        self._import_price_list(supplier=supplier)
+
+    def _on_catalog_tree_click(self, event: tk.Event) -> str | None:
+        if not hasattr(self, "catalog_tree"):
+            return None
+        item_id = self.catalog_tree.identify_row(event.y)
+        column = self.catalog_tree.identify_column(event.x)
+        if not item_id or column != "#1":
+            return None
+        meta = self._catalog_tree_items.get(item_id)
+        if not meta or meta.get("type") != "price":
+            return None
+        bbox = self.catalog_tree.bbox(item_id, "actions")
+        if not bbox:
+            return None
+        x1, _y1, width, _height = bbox
+        relative_x = event.x - x1
+        if relative_x < 0 or width <= 0:
+            return None
+        self.catalog_tree.selection_set(item_id)
+        if relative_x <= width / 2:
+            self._refresh_price_file()
+        else:
+            self._configure_auto_update()
+        return "break"
+
+    def _on_catalog_context_request(self, event: tk.Event) -> None:
+        if not hasattr(self, "catalog_tree"):
+            return
+        item_id = self.catalog_tree.identify_row(event.y)
+        if not item_id:
+            return
+        self.catalog_tree.selection_set(item_id)
+        meta = self._catalog_tree_items.get(item_id)
+        if not meta:
+            return
+        menu = self._supplier_menu if meta.get("type") != "price" else self._price_menu
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        
 
     # ------------------------------------------------------------------
     # Import / export actions
     # ------------------------------------------------------------------
-    def _import_price_list(self) -> None:
+    def _import_price_list(self, supplier: str | None = None) -> None:
         path = filedialog.askopenfilename(
             title="Оберіть файл прайсу",
             filetypes=(
@@ -543,7 +805,8 @@ class PriceCompareApp(tk.Tk):
         if not path:
             return
 
-        supplier = simpledialog.askstring("Постачальник", "Назва постачальника:")
+        if supplier is None:
+            supplier = simpledialog.askstring("Постачальник", "Назва постачальника:")
         if not supplier:
             messagebox.showinfo("Імпорт перервано", "Назва постачальника не вказана.")
             return
@@ -590,11 +853,37 @@ class PriceCompareApp(tk.Tk):
         column_mapping = dialog.result["column_mapping"]
         save_template = dialog.result["save_template"]
 
+        existing_metadata = {}
+        if supplier in self.price_lists:
+            existing_metadata = dict(self.price_lists[supplier].metadata)
+
         def task() -> PriceList:
             price_list = self.importer.load(
                 path, supplier=supplier, column_mapping=column_mapping
             )
             self.tagger.apply(price_list.products)
+            metadata = dict(existing_metadata)
+            prices_meta = metadata.get("prices")
+            if not isinstance(prices_meta, list):
+                prices_meta = []
+            price_entry: Dict[str, object] | None = None
+            for entry in prices_meta:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("id") or entry.get("name") or "default") == "default":
+                    price_entry = entry
+                    break
+            if price_entry is None:
+                price_entry = {"id": "default"}
+                prices_meta.append(price_entry)
+            price_entry["name"] = Path(path).name
+            price_entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+            if "auto_update" not in price_entry and metadata.get("auto_update"):
+                price_entry["auto_update"] = metadata.get("auto_update")
+            metadata["price_name"] = price_entry["name"]
+            metadata["updated_at"] = price_entry["updated_at"]
+            metadata["prices"] = prices_meta
+            price_list.metadata = metadata
             self.repository.save(price_list)
             if save_template:
                 self.template_store.save_template(supplier, column_mapping, headers)
@@ -627,14 +916,25 @@ class PriceCompareApp(tk.Tk):
             on_error=on_error,
         )
 
-    def _export_supplier(self) -> None:
-        supplier = self._selected_supplier()
-        if not supplier:
-            messagebox.showwarning("Експорт", "Оберіть постачальника зі списку.")
+    def _export_selected_prices(self) -> None:
+        prices = self._selected_price_nodes()
+        if not prices:
+            messagebox.showwarning("Експорт", "Оберіть прайс у списку.")
+            return
+        if len(prices) > 1:
+            messagebox.showinfo("Експорт", "Оберіть один прайс для експорту.")
             return
 
+        meta = prices[0]
+        supplier = meta.get("supplier")
+        if not supplier:
+            return
         price_list = self.price_lists.get(supplier)
         if not price_list:
+            messagebox.showwarning("Експорт", "Прайс не знайдено.")
+            return
+        if not price_list.products:
+            messagebox.showwarning("Експорт", "У прайсі немає товарів для експорту.")
             return
 
         path = filedialog.asksaveasfilename(
@@ -658,22 +958,203 @@ class PriceCompareApp(tk.Tk):
 
         messagebox.showinfo("Готово", "Дані успішно збережено.")
 
-    def _delete_supplier(self) -> None:
-        supplier = self._selected_supplier()
-        if not supplier:
-            messagebox.showwarning("Видалення", "Оберіть постачальника зі списку.")
+    def _delete_selected_prices(self) -> None:
+        prices = self._selected_price_nodes()
+        if not prices:
+            supplier = self._selected_supplier_from_tree()
+            if not supplier:
+                messagebox.showwarning("Видалення", "Оберіть прайс у списку.")
+                return
+            if not messagebox.askyesno(
+                "Видалення",
+                "Видалити всі прайси постачальника '{}' ?".format(supplier),
+            ):
+                return
+            try:
+                self.repository.delete(supplier)
+            except Exception as exc:
+                messagebox.showerror("Помилка", f"Не вдалося видалити дані: {exc}")
+                return
+            self.refresh_data()
             return
 
+        confirm_names = []
+        for meta in prices:
+            supplier = meta.get("supplier") or "?"
+            price_name = meta.get("name") or "прайс"
+            confirm_names.append(f"{price_name} ({supplier})")
         if not messagebox.askyesno(
-            "Видалення", f"Видалити прайс постачальника '{supplier}'?"
+            "Видалення",
+            "Видалити прайси:\n - " + "\n - ".join(confirm_names) + "?",
         ):
             return
 
+        for meta in prices:
+            supplier = meta.get("supplier")
+            price_id = meta.get("price_id") or "default"
+            if not supplier:
+                continue
+            price_list = self.price_lists.get(supplier)
+            if not price_list:
+                continue
+            metadata = dict(price_list.metadata or {})
+            prices_meta = metadata.get("prices")
+            if isinstance(prices_meta, list):
+                metadata["prices"] = [
+                    entry
+                    for entry in prices_meta
+                    if str(entry.get("id") or entry.get("name") or "default") != str(price_id)
+                ]
+            else:
+                metadata["prices"] = []
+            metadata.pop("price_name", None)
+            metadata.pop("updated_at", None)
+            price_list.metadata = metadata
+            price_list.products = []
+            try:
+                self.repository.save(price_list)
+            except Exception as exc:
+                messagebox.showerror("Помилка", f"Не вдалося оновити дані: {exc}")
+                return
+
+        self.refresh_data()
+
+    def _add_supplier(self) -> None:
+        name = simpledialog.askstring("Новий постачальник", "Назва постачальника:")
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showwarning("Постачальник", "Назва не може бути порожньою.")
+            return
+        if name in self.price_lists:
+            messagebox.showwarning("Постачальник", "Такий постачальник вже існує.")
+            return
+        price_list = PriceList(supplier=name, products=[], metadata={"prices": []})
+        try:
+            self.repository.save(price_list)
+        except Exception as exc:
+            messagebox.showerror("Помилка", f"Не вдалося створити постачальника: {exc}")
+            return
+        self.refresh_data()
+
+    def _remove_supplier(self) -> None:
+        supplier = self._selected_supplier_from_tree()
+        if not supplier:
+            messagebox.showwarning("Видалення", "Оберіть постачальника у списку.")
+            return
+        if not messagebox.askyesno(
+            "Видалення",
+            f"Видалити постачальника '{supplier}' та всі його дані?",
+        ):
+            return
         try:
             self.repository.delete(supplier)
         except Exception as exc:
             messagebox.showerror("Помилка", f"Не вдалося видалити дані: {exc}")
             return
+        self.refresh_data()
+
+    def _rename_supplier(self) -> None:
+        supplier = self._selected_supplier_from_tree()
+        if not supplier:
+            messagebox.showwarning("Перейменування", "Оберіть постачальника у списку.")
+            return
+        new_name = simpledialog.askstring(
+            "Перейменувати постачальника",
+            "Нова назва:",
+            initialvalue=supplier,
+        )
+        if not new_name or new_name.strip() == supplier:
+            return
+        new_name = new_name.strip()
+        if new_name in self.price_lists:
+            messagebox.showwarning("Перейменування", "Постачальник з такою назвою вже існує.")
+            return
+        try:
+            self.repository.rename(supplier, new_name)
+        except Exception as exc:
+            messagebox.showerror("Помилка", f"Не вдалося перейменувати: {exc}")
+            return
+        self.refresh_data()
+
+    def _refresh_price_file(self) -> None:
+        prices = self._selected_price_nodes()
+        if not prices:
+            messagebox.showwarning("Оновлення", "Оберіть прайс у списку.")
+            return
+        if len(prices) > 1:
+            messagebox.showinfo("Оновлення", "Оберіть один прайс для оновлення.")
+            return
+        supplier = prices[0].get("supplier")
+        if not supplier:
+            return
+        self._import_price_list(supplier=supplier)
+
+    def _configure_auto_update(self) -> None:
+        prices = self._selected_price_nodes()
+        if not prices:
+            messagebox.showwarning("Автооновлення", "Оберіть прайс у списку.")
+            return
+        if len(prices) > 1:
+            messagebox.showinfo("Автооновлення", "Налаштувати можна лише один прайс за раз.")
+            return
+        meta = prices[0]
+        supplier = meta.get("supplier")
+        price_id = meta.get("price_id") or "default"
+        if not supplier:
+            return
+        price_list = self.price_lists.get(supplier)
+        if not price_list:
+            return
+        metadata = dict(price_list.metadata or {})
+        prices_meta = metadata.get("prices")
+        entry: Dict[str, object] | None = None
+        if isinstance(prices_meta, list):
+            for candidate in prices_meta:
+                if not isinstance(candidate, dict):
+                    continue
+                if str(candidate.get("id") or candidate.get("name") or "default") == str(price_id):
+                    entry = candidate
+                    break
+        if entry is None:
+            entry = {"id": price_id}
+            prices_meta = prices_meta if isinstance(prices_meta, list) else []
+            prices_meta.append(entry)
+            metadata["prices"] = prices_meta
+
+        templates = self.template_store.list_templates()
+        current_template = entry.get("auto_update", {}).get("template") if isinstance(entry.get("auto_update"), dict) else None
+
+        dialog = AutoUpdateDialog(
+            self,
+            supplier=supplier,
+            price_name=str(meta.get("name") or "Прайс"),
+            templates=templates,
+            current_template=current_template,
+            initial_settings=entry.get("auto_update", {}),
+        )
+        self.wait_window(dialog)
+        if not dialog.result:
+            return
+
+        settings = dialog.result.get("settings") or {}
+        entry["auto_update"] = settings
+        metadata["prices"] = prices_meta if isinstance(prices_meta, list) else [entry]
+        price_list.metadata = metadata
+        try:
+            self.repository.save(price_list)
+        except Exception as exc:
+            messagebox.showerror(
+                "Автооновлення", f"Не вдалося зберегти налаштування: {exc}"
+            )
+            return
+
+        if dialog.result.get("action") == "run":
+            messagebox.showinfo(
+                "Автооновлення",
+                "Запуск автооновлення наразі доступний після збереження налаштувань.",
+            )
 
         self.refresh_data()
 
@@ -3043,6 +3524,173 @@ class ComparisonBoard(ttk.Frame):
 
     def _label_for_sort(self, key: str) -> str:
         return next((label for option, label in self.SORT_OPTIONS if option == key), self.SORT_OPTIONS[0][1])
+
+class AutoUpdateDialog(tk.Toplevel):
+    SOURCE_OPTIONS = (
+        ("HTTP_FILE", "HTTP файл"),
+        ("GOOGLE_SHEETS", "Google Sheets"),
+        ("XML_FEED", "XML feed"),
+    )
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        supplier: str,
+        price_name: str,
+        templates: Sequence[ImportTemplate],
+        current_template: str | None,
+        initial_settings: Mapping[str, object],
+    ) -> None:
+        super().__init__(master)
+        self.title("Налаштувати автооновлення")
+        self.transient(master)
+        self.grab_set()
+        self.resizable(False, False)
+
+        self.result: Optional[Dict[str, object]] = None
+
+        container = ttk.Frame(self, padding=12)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        info = ttk.LabelFrame(container, text="Прайс")
+        info.pack(fill=tk.X, pady=(0, 12))
+        ttk.Label(info, text="Постачальник:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(info, text=supplier, font=("TkDefaultFont", 10, "bold")).grid(
+            row=0, column=1, sticky=tk.W, padx=(6, 0)
+        )
+        ttk.Label(info, text="Прайс:").grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+        ttk.Label(info, text=price_name).grid(row=1, column=1, sticky=tk.W, padx=(6, 0), pady=(4, 0))
+
+        settings = ttk.LabelFrame(container, text="Джерело")
+        settings.pack(fill=tk.BOTH, expand=True)
+
+        self.source_var = tk.StringVar(
+            value=str(initial_settings.get("source_type") or "HTTP_FILE")
+        )
+        self.url_var = tk.StringVar(value=str(initial_settings.get("url") or ""))
+        self.auth_var = tk.StringVar(value=str(initial_settings.get("auth_token") or ""))
+        headers_text = initial_settings.get("headers") or ""
+        if isinstance(headers_text, dict):
+            headers_text = "\n".join(f"{k}: {v}" for k, v in headers_text.items())
+        self.schedule_var = tk.StringVar(value=str(initial_settings.get("schedule") or ""))
+
+        ttk.Label(settings, text="Тип джерела:").grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+        source_combo = ttk.Combobox(
+            settings,
+            state="readonly",
+            values=[label for _value, label in self.SOURCE_OPTIONS],
+            width=26,
+        )
+        source_combo.grid(row=0, column=1, sticky=tk.W, pady=4)
+        source_map = {label: value for value, label in self.SOURCE_OPTIONS}
+        label_map = {value: label for value, label in self.SOURCE_OPTIONS}
+        source_combo.set(label_map.get(self.source_var.get(), "HTTP файл"))
+
+        def on_source_selected(_event: object) -> None:
+            self.source_var.set(source_map.get(source_combo.get(), "HTTP_FILE"))
+
+        source_combo.bind("<<ComboboxSelected>>", on_source_selected)
+
+        ttk.Label(settings, text="URL / ID:").grid(row=1, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.url_var, width=46).grid(
+            row=1, column=1, sticky=tk.EW, pady=4
+        )
+
+        ttk.Label(settings, text="Auth token / headers:").grid(
+            row=2, column=0, sticky=tk.NW, padx=(0, 8), pady=4
+        )
+        self.headers_text = tk.Text(settings, width=46, height=4)
+        self.headers_text.grid(row=2, column=1, sticky=tk.EW, pady=4)
+        if headers_text:
+            self.headers_text.insert("1.0", str(headers_text))
+
+        ttk.Label(settings, text="Розклад:").grid(row=3, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.schedule_var, width=46).grid(
+            row=3, column=1, sticky=tk.EW, pady=4
+        )
+
+        ttk.Label(settings, text="Auth token:").grid(row=4, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+        ttk.Entry(settings, textvariable=self.auth_var, width=46).grid(
+            row=4, column=1, sticky=tk.EW, pady=4
+        )
+
+        template_frame = ttk.LabelFrame(container, text="Шаблон імпорту")
+        template_frame.pack(fill=tk.X, pady=(8, 0))
+        template_names = sorted({template.supplier for template in templates} or {supplier})
+        self.template_var = tk.StringVar(
+            value=str(
+                current_template
+                if current_template in template_names
+                else (template_names[0] if template_names else "")
+            )
+        )
+        ttk.Combobox(
+            template_frame,
+            state="readonly",
+            values=template_names,
+            textvariable=self.template_var,
+            width=40,
+        ).pack(side=tk.LEFT, padx=(8, 0), pady=8)
+
+        button_bar = ttk.Frame(container)
+        button_bar.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(button_bar, text="Скасувати", command=self._on_cancel).pack(
+            side=tk.RIGHT
+        )
+        ttk.Button(button_bar, text="Зберегти", command=self._on_save).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+        ttk.Button(button_bar, text="Запустити зараз", command=self._on_run).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+
+        self.bind("<Escape>", lambda _event: self._on_cancel())
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.geometry(_center_dialog(self, master))
+
+    def _collect_settings(self) -> Optional[Dict[str, object]]:
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showwarning(
+                "Автооновлення", "Вкажіть URL або ID джерела.", parent=self
+            )
+            return None
+        template = self.template_var.get().strip()
+        if not template:
+            messagebox.showwarning(
+                "Автооновлення", "Оберіть шаблон імпорту.", parent=self
+            )
+            return None
+        headers_raw = self.headers_text.get("1.0", tk.END).strip()
+        settings: Dict[str, object] = {
+            "source_type": self.source_var.get(),
+            "url": url,
+            "auth_token": self.auth_var.get().strip(),
+            "headers": headers_raw,
+            "schedule": self.schedule_var.get().strip(),
+            "template": template,
+        }
+        return settings
+
+    def _on_save(self) -> None:
+        settings = self._collect_settings()
+        if settings is None:
+            return
+        self.result = {"action": "save", "settings": settings}
+        self.destroy()
+
+    def _on_run(self) -> None:
+        settings = self._collect_settings()
+        if settings is None:
+            return
+        self.result = {"action": "run", "settings": settings}
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
 
 class ImportSettingsDialog(tk.Toplevel):
     """Dialog window for configuring import column mapping."""
