@@ -7,3 +7,7 @@ suppliers:
 matching:
   brand_aliases: {"mi": "xiaomi", "apple inc.": "apple"}
   fuzzy_thresholds: {strong: 92, medium: 85, weak: 75}
+sheets:
+  spreadsheet_id: "<<<ВСТАВИТИ_ID_ТАБЛИЦІ>>>"
+exports:
+  output_dir: "./exports"

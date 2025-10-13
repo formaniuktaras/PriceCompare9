@@ -27,12 +27,28 @@ class MatchingConfig:
 
 
 @dataclass(frozen=True)
+class SheetsConfig:
+    """Configuration for Google Sheets integration."""
+
+    spreadsheet_id: str
+
+
+@dataclass(frozen=True)
+class ExportsConfig:
+    """Configuration for export output locations."""
+
+    output_dir: Path
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Top level configuration container."""
 
     data_root: Path
     suppliers: tuple[SupplierConfig, ...]
     matching: MatchingConfig
+    sheets: SheetsConfig | None
+    exports: ExportsConfig
 
     def iter_supplier_jobs(self) -> Iterable[tuple[str, Path]]:
         """Yield (supplier_key, path) tuples for import jobs."""
@@ -84,7 +100,29 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         fuzzy_thresholds={str(k): int(v) for k, v in matching_raw.get("fuzzy_thresholds", {}).items()},
     )
 
-    return AppConfig(data_root=data_root, suppliers=tuple(suppliers), matching=matching)
+    sheets_raw = payload.get("sheets")
+    sheets = None
+    if sheets_raw:
+        spreadsheet_id = sheets_raw.get("spreadsheet_id")
+        if spreadsheet_id:
+            sheets = SheetsConfig(spreadsheet_id=str(spreadsheet_id))
+
+    exports_raw = payload.get("exports", {})
+    output_dir_raw = exports_raw.get("output_dir", "./exports")
+    output_dir_path = Path(output_dir_raw)
+    if not output_dir_path.is_absolute():
+        output_dir_path = (base_dir / output_dir_path).resolve()
+    else:
+        output_dir_path = output_dir_path.resolve()
+    exports = ExportsConfig(output_dir=output_dir_path)
+
+    return AppConfig(
+        data_root=data_root,
+        suppliers=tuple(suppliers),
+        matching=matching,
+        sheets=sheets,
+        exports=exports,
+    )
 
 
 def data_root() -> Path:
