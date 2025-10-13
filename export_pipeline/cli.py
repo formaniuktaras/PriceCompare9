@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import pandas as pd
 
@@ -21,6 +22,21 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_CHANNEL = "prom"
 EXPORT_SHEET = "Export_Staging"
 PROM_SHEET = "Export_Prom"
+
+
+ProgressCallback = Callable[[str, int], None]
+LogCallback = Callable[[str], None]
+CancelCallback = Callable[[], None]
+
+
+@dataclass(slots=True)
+class ExportResult:
+    """Container for export pipeline outcomes."""
+
+    channel: str
+    staging_df: pd.DataFrame
+    prom_df: pd.DataFrame
+    created_files: list[Path]
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -115,9 +131,21 @@ def _export_paths(output_dir: Path, channel: str, formats: Iterable[str]) -> dic
     return paths
 
 
-def _write_formats(prom_df: pd.DataFrame, paths: dict[str, Path], selling_type: str) -> list[Path]:
+def _write_formats(
+    prom_df: pd.DataFrame,
+    paths: dict[str, Path],
+    selling_type: str,
+    *,
+    progress: ProgressCallback | None = None,
+    log: LogCallback | None = None,
+    check_cancel: CancelCallback | None = None,
+) -> list[Path]:
     created: list[Path] = []
     for fmt, path in paths.items():
+        if check_cancel:
+            check_cancel()
+        if log:
+            log(f"Пишемо {fmt.upper()} у {path.resolve()}")
         if fmt == "csv":
             to_csv(prom_df, path)
         elif fmt == "xlsx":
@@ -127,40 +155,117 @@ def _write_formats(prom_df: pd.DataFrame, paths: dict[str, Path], selling_type: 
         else:  # pragma: no cover - guarded by parser
             raise ValueError(f"Unsupported format {fmt}")
         created.append(path.resolve())
+        if progress:
+            progress(f"format:{fmt}", 1)
     return created
 
 
-def _update_sheets(cfg: AppConfig, staging_df: pd.DataFrame, prom_df: pd.DataFrame) -> None:
+def _update_sheets(
+    cfg: AppConfig,
+    staging_df: pd.DataFrame,
+    prom_df: pd.DataFrame,
+    *,
+    log: LogCallback | None = None,
+    progress: ProgressCallback | None = None,
+    check_cancel: CancelCallback | None = None,
+) -> None:
     if not cfg.sheets:
-        LOGGER.info("Sheets configuration missing; skipping Google Sheets updates")
+        message = "Sheets configuration missing; skipping Google Sheets updates"
+        LOGGER.info(message)
+        if log:
+            log(message)
         return
 
     spreadsheet_id = cfg.sheets.spreadsheet_id
+    if check_cancel:
+        check_cancel()
+    if log:
+        log(f"Оновлюємо Google Sheet {spreadsheet_id} (Export_Staging)")
     ensure_sheet(spreadsheet_id, EXPORT_SHEET, list(staging_df.columns))
     write_df(spreadsheet_id, EXPORT_SHEET, staging_df)
 
+    if check_cancel:
+        check_cancel()
+    if log:
+        log(f"Оновлюємо Google Sheet {spreadsheet_id} (Export_Prom)")
     ensure_sheet(spreadsheet_id, PROM_SHEET, list(prom_df.columns))
     write_df(spreadsheet_id, PROM_SHEET, prom_df)
+    if progress:
+        progress("sheets", 1)
 
 
-def _run_export(cfg: AppConfig, channel: str, formats: Iterable[str], selling_type: str) -> list[Path]:
+def run_export(
+    cfg: AppConfig,
+    channel: str,
+    formats: Iterable[str],
+    selling_type: str,
+    *,
+    progress: ProgressCallback | None = None,
+    log: LogCallback | None = None,
+    check_cancel: CancelCallback | None = None,
+) -> ExportResult:
     if channel != DEFAULT_CHANNEL:
         raise ValueError(f"Unsupported channel {channel}")
 
+    format_list = list(formats)
+
+    if check_cancel:
+        check_cancel()
     raw_df = get_raw_df(cfg)
+    if log:
+        log(f"Завантажено сирі дані: {len(raw_df)} рядків")
+    if progress:
+        progress("raw", 1)
+
+    if check_cancel:
+        check_cancel()
     staging_df = build_staging_df(raw_df)
     staging_df = _filter_excluded(staging_df)
+    if log:
+        log(f"Побудовано Export_Staging: {len(staging_df)} рядків")
+    if progress:
+        progress("staging", 1)
 
+    if check_cancel:
+        check_cancel()
     prom_df = staging_to_prom(staging_df)
+    if log:
+        log(f"Підготовлено Export_Prom: {len(prom_df)} рядків")
+    if progress:
+        progress("prom", 1)
 
-    _update_sheets(cfg, staging_df, prom_df)
+    _update_sheets(
+        cfg,
+        staging_df,
+        prom_df,
+        log=log,
+        progress=progress,
+        check_cancel=check_cancel,
+    )
 
     output_dir = cfg.exports.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    paths = _export_paths(output_dir, channel, formats)
-    created = _write_formats(prom_df, paths, selling_type)
-    return created
+    paths = _export_paths(output_dir, channel, format_list)
+    created = _write_formats(
+        prom_df,
+        paths,
+        selling_type,
+        progress=progress,
+        log=log,
+        check_cancel=check_cancel,
+    )
+
+    if log:
+        for path in created:
+            log(f"Створено файл {path}")
+
+    return ExportResult(
+        channel=channel,
+        staging_df=staging_df,
+        prom_df=prom_df,
+        created_files=created,
+    )
 
 
 def main(argv: Iterable[str] | None = None) -> None:
@@ -172,8 +277,8 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     if args.command == "export":
         formats = _resolve_formats(args.format)
-        created = _run_export(cfg, args.channel, formats, args.selling_type)
-        for path in created:
+        result = run_export(cfg, args.channel, formats, args.selling_type)
+        for path in result.created_files:
             print(path)
     else:  # pragma: no cover - argparse ensures command
         parser.error(f"Unknown command {args.command}")

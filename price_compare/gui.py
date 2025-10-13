@@ -26,6 +26,7 @@ from typing import (
 
 from .comparison_engine import ComparisonBuilder, ComparisonGroup, SupplierMatch
 from .comparison_state import ComparisonStateStore
+from .config import load_config
 from .io import MissingRequiredColumnsError, PriceListExporter, PriceListImporter
 from .model_templates import ModelTemplatesEditor
 from .models import PriceList, Product
@@ -36,6 +37,7 @@ from . import tags_assignment
 from .templates import ImportTemplate, ImportTemplateStore
 from .progress import ProgressTracker
 from .progress_window import run_with_worker_pool
+from export_pipeline.cli import DEFAULT_CHANNEL, ExportResult, run_export
 
 if TYPE_CHECKING:
     from .synonyms_manager import SynonymsManager
@@ -161,18 +163,27 @@ class PriceCompareApp(tk.Tk):
         self.search_tab = ttk.Frame(container)
         self.tags_tab = ttk.Frame(container)
         self.compare_tab = ttk.Frame(container)
+        self.export_tab = ExportTab(
+            container,
+            default_config_path=self._default_config_path(),
+        )
 
         container.add(self.main_price_tab, text="Основний прайс")
         container.add(self.catalog_tab, text="Каталог постачальників")
         container.add(self.search_tab, text="Пошук")
         container.add(self.tags_tab, text="Мітки")
         container.add(self.compare_tab, text="Порівняння")
+        container.add(self.export_tab, text="Експорт")
 
         self._build_main_price_tab()
         self._build_catalog_tab()
         self._build_search_tab()
         self._build_tags_tab()
         self._build_compare_tab()
+
+    def _default_config_path(self) -> Path:
+        package_root = Path(__file__).resolve().parent.parent
+        return (package_root / "config.yaml").resolve()
 
     def _set_links_button_state(self, enabled: bool) -> None:
         if self._catalog_links_button is None:
@@ -3034,6 +3045,236 @@ class TagsTab(ttk.Frame):
         assignment.selected_tags = set(dialog.result)
         tags_assignment.validate_tags([assignment], self.templates)
         self._update_tree()
+
+
+class ExportTab(ttk.Frame):
+    """Tab for running the export pipeline from the GUI."""
+
+    def __init__(self, master: tk.Misc, *, default_config_path: Path) -> None:
+        super().__init__(master)
+        self.default_config_path = Path(default_config_path)
+        self.config_path_var = tk.StringVar(value=str(self.default_config_path))
+        self.channel_var = tk.StringVar(value=DEFAULT_CHANNEL)
+        self.selling_type_var = tk.StringVar(value="r")
+        self.format_vars: dict[str, tk.BooleanVar] = {
+            "csv": tk.BooleanVar(value=True),
+            "xlsx": tk.BooleanVar(value=True),
+            "xml": tk.BooleanVar(value=True),
+        }
+        self.status_var = tk.StringVar(value="Готово")
+        self._last_result: ExportResult | None = None
+
+        self._format_checks: list[ttk.Checkbutton] = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        header = ttk.Label(
+            self,
+            text="Формуйте файл імпорту та синхронізуйте вкладки Google Sheets",
+            anchor=tk.W,
+        )
+        header.pack(fill=tk.X, padx=12, pady=(12, 4))
+
+        config_frame = ttk.Frame(self, padding=(12, 0))
+        config_frame.pack(fill=tk.X)
+
+        ttk.Label(config_frame, text="Файл config.yaml:").grid(row=0, column=0, sticky=tk.W)
+        self.config_entry = ttk.Entry(config_frame, textvariable=self.config_path_var)
+        self.config_entry.grid(row=0, column=1, sticky=tk.EW, padx=(8, 0))
+        self.choose_button = ttk.Button(
+            config_frame,
+            text="Обрати…",
+            command=self._choose_config,
+            width=16,
+        )
+        self.choose_button.grid(row=0, column=2, padx=(8, 0), sticky=tk.W)
+        config_frame.columnconfigure(1, weight=1)
+
+        options = ttk.Frame(self, padding=(12, 8))
+        options.pack(fill=tk.X)
+
+        ttk.Label(options, text="Канал:").grid(row=0, column=0, sticky=tk.W)
+        self.channel_combo = ttk.Combobox(
+            options,
+            textvariable=self.channel_var,
+            values=[DEFAULT_CHANNEL],
+            state="readonly",
+            width=14,
+        )
+        self.channel_combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 24))
+
+        ttk.Label(options, text="Selling type (XML):").grid(row=0, column=2, sticky=tk.W)
+        self.selling_type_entry = ttk.Entry(options, textvariable=self.selling_type_var, width=6)
+        self.selling_type_entry.grid(row=0, column=3, sticky=tk.W, padx=(8, 0))
+        options.columnconfigure(4, weight=1)
+
+        formats_frame = ttk.LabelFrame(self, text="Формати експорту", padding=12)
+        formats_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        for idx, fmt in enumerate(["csv", "xlsx", "xml"]):
+            check = ttk.Checkbutton(
+                formats_frame,
+                text=fmt.upper(),
+                variable=self.format_vars[fmt],
+            )
+            check.grid(row=0, column=idx, padx=(0, 12), sticky=tk.W)
+            self._format_checks.append(check)
+        formats_frame.columnconfigure(len(self._format_checks), weight=1)
+
+        controls = ttk.Frame(self, padding=(12, 0))
+        controls.pack(fill=tk.X)
+
+        self.run_button = ttk.Button(controls, text="Запустити експорт", command=self._on_run)
+        self.run_button.pack(side=tk.LEFT)
+
+        ttk.Button(controls, text="Очистити лог", command=self._clear_log).pack(side=tk.RIGHT)
+        ttk.Label(controls, textvariable=self.status_var).pack(side=tk.RIGHT, padx=(0, 12))
+
+        log_frame = ttk.LabelFrame(self, text="Журнал виконання", padding=0)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 12))
+
+        self.log_text = tk.Text(log_frame, height=16, wrap="word", state=tk.DISABLED)
+        scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _choose_config(self) -> None:
+        initial = self.config_path_var.get()
+        path = filedialog.askopenfilename(
+            title="Оберіть config.yaml",
+            initialfile=initial if initial else None,
+            filetypes=[("YAML", "*.yaml *.yml"), ("Усі файли", "*.*")],
+        )
+        if path:
+            self.config_path_var.set(path)
+
+    def _clear_log(self) -> None:
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _selected_formats(self) -> list[str]:
+        return [fmt for fmt, var in self.format_vars.items() if var.get()]
+
+    def _set_running(self, running: bool) -> None:
+        if running:
+            self.run_button.state(["disabled"])
+            self.choose_button.state(["disabled"])
+            self.channel_combo.configure(state="disabled")
+            self.selling_type_entry.configure(state=tk.DISABLED)
+            self.config_entry.configure(state=tk.DISABLED)
+            for check in self._format_checks:
+                check.state(["disabled"])
+        else:
+            self.run_button.state(["!disabled"])
+            self.choose_button.state(["!disabled"])
+            self.channel_combo.configure(state="readonly")
+            self.selling_type_entry.configure(state=tk.NORMAL)
+            self.config_entry.configure(state=tk.NORMAL)
+            for check in self._format_checks:
+                check.state(["!disabled"])
+
+    def _on_run(self) -> None:
+        config_path = Path(self.config_path_var.get()).expanduser()
+        if not config_path.exists():
+            messagebox.showerror("Експорт", f"Файл конфігурації не знайдено: {config_path}")
+            return
+
+        formats = self._selected_formats()
+        if not formats:
+            messagebox.showwarning("Експорт", "Оберіть хоча б один формат експорту")
+            return
+
+        selling_type = self.selling_type_var.get().strip() or "r"
+        self.selling_type_var.set(selling_type)
+        channel = self.channel_var.get() or DEFAULT_CHANNEL
+
+        summary = ", ".join(fmt.upper() for fmt in formats)
+        self._log(f"Старт експорту: канал {channel}, формати {summary}")
+        self.status_var.set("Виконується…")
+        self._set_running(True)
+
+        tracker = ProgressTracker()
+
+        def job(_executor, progress_tracker: ProgressTracker):
+            resolved_config = config_path.resolve()
+            messages: list[str] = [f"Файл конфігурації: {resolved_config}"]
+            load_config.cache_clear()
+            cfg = load_config(resolved_config)
+
+            total_steps = 3 + len(formats)
+            if cfg.sheets:
+                total_steps += 1
+            progress_tracker.reset(total=max(total_steps, 1))
+
+            def log_message(msg: str) -> None:
+                messages.append(msg)
+
+            def progress_step(_name: str, amount: int) -> None:
+                progress_tracker.advance(amount)
+
+            def check_cancel() -> None:
+                progress_tracker.wait_if_paused()
+                progress_tracker.raise_if_cancelled()
+
+            check_cancel()
+            result = run_export(
+                cfg,
+                channel,
+                formats,
+                selling_type,
+                progress=progress_step,
+                log=log_message,
+                check_cancel=check_cancel,
+            )
+            return result, messages
+
+        def on_success(payload: tuple[ExportResult, list[str]]) -> None:
+            result, messages = payload
+            self._last_result = result
+            for message in messages:
+                self._log(message)
+            if result.created_files:
+                for path in result.created_files:
+                    self._log(f"✔ {path}")
+                messagebox.showinfo(
+                    "Експорт",
+                    "Експорт завершено успішно.\n" + "\n".join(str(path) for path in result.created_files),
+                )
+            else:
+                self._log("Не створено жодного файлу.")
+                messagebox.showinfo("Експорт", "Експорт завершено: немає файлів для запису")
+            self.status_var.set("Готово")
+            self._set_running(False)
+
+        def on_error(exc: Exception) -> None:
+            self._log(f"Помилка: {exc}")
+            self.status_var.set("Помилка")
+            self._set_running(False)
+            messagebox.showerror("Експорт", f"Не вдалося виконати експорт: {exc}")
+
+        def on_cancel() -> None:
+            self._log("Операцію скасовано")
+            self.status_var.set("Скасовано")
+            self._set_running(False)
+
+        run_with_worker_pool(
+            master=self.winfo_toplevel(),
+            title="Експорт",
+            tracker=tracker,
+            job=job,
+            on_success=on_success,
+            on_error=on_error,
+            on_cancel=on_cancel,
+        )
 
     def _on_tree_click(self, event: tk.Event[tk.Misc]) -> str | None:  # type: ignore[name-defined]
         region = self.tree.identify_region(event.x, event.y)

@@ -1,4 +1,4 @@
-"""Writers for exporting channel data to various formats."""
+"""Output writers for the export pipeline."""
 
 from __future__ import annotations
 
@@ -117,7 +117,7 @@ def to_priceua_xml(
             f"      <vendor>{escape(_safe_text(row.get('Бренд')), XML_ESCAPE_MAP)}</vendor>"
         )
         lines.append(
-            f"      <model>{escape(_safe_text(row.get('Артикул')), XML_ESCAPE_MAP)}</model>"
+            f"      <model>{escape(_safe_text(row.get('Назва товару')), XML_ESCAPE_MAP)}</model>"
         )
         lines.append(
             f"      <categoryId>{escape(_safe_text(row.get('Категорія')), XML_ESCAPE_MAP)}</categoryId>"
