@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Sequence, Set, Tuple
 
 from .models import PriceList, Product
+from .progress import ProgressTracker
 
 
 def _stable_hash(*parts: str) -> str:
@@ -67,14 +68,22 @@ class ComparisonBuilder:
         self.max_matches = max_matches
         self._token_cache: Dict[int, FrozenSet[str]] = {}
 
-    def build(self) -> List[ComparisonGroup]:
+    def build(self, tracker: ProgressTracker | None = None) -> List[ComparisonGroup]:
         supplier_pool: List[Tuple[str, Product, FrozenSet[str]]] = []
         supplier_stats: Dict[str, float] = {}
         token_index: Dict[str, List[int]] = defaultdict(list)
         sku_index: Dict[str, List[int]] = defaultdict(list)
 
+        if tracker:
+            supplier_product_count = sum(len(price_list.products) for price_list in self.supplier_lists)
+            total_steps = supplier_product_count * 2 + len(self.store_products)
+            tracker.reset(total_steps)
+
         for price_list in self.supplier_lists:
             for product in price_list.products:
+                if tracker:
+                    tracker.wait_if_paused()
+                    tracker.raise_if_cancelled()
                 match_id = self._match_id(product)
                 tokens = self._token_set(product)
                 index = len(supplier_pool)
@@ -84,9 +93,14 @@ class ComparisonBuilder:
                     sku_index[product.sku.lower()].append(index)
                 for token in tokens:
                     token_index[token].append(index)
+                if tracker:
+                    tracker.advance()
 
         groups: List[ComparisonGroup] = []
         for product in sorted(self.store_products, key=lambda item: item.name.lower()):
+            if tracker:
+                tracker.wait_if_paused()
+                tracker.raise_if_cancelled()
             group_id = self._group_id(product)
             matches: List[SupplierMatch] = []
             store_tokens = self._token_set(product)
@@ -121,9 +135,17 @@ class ComparisonBuilder:
                     supplier_matches=matches,
                 )
             )
+            if tracker:
+                tracker.advance()
 
-        unmatched_groups = self._build_supplier_only_groups(supplier_pool, supplier_stats)
+        unmatched_groups = self._build_supplier_only_groups(
+            supplier_pool,
+            supplier_stats,
+            tracker=tracker,
+        )
         groups.extend(unmatched_groups)
+        if tracker:
+            tracker.mark_finished()
         return groups
 
     # ------------------------------------------------------------------
@@ -169,16 +191,25 @@ class ComparisonBuilder:
         self,
         supplier_pool: Sequence[Tuple[str, Product, FrozenSet[str]]],
         stats: Dict[str, float],
+        *,
+        tracker: ProgressTracker | None = None,
     ) -> List[ComparisonGroup]:
         buckets: Dict[str, List[Tuple[str, Product]]] = defaultdict(list)
         for match_id, product, tokens in supplier_pool:
+            if tracker:
+                tracker.wait_if_paused()
+                tracker.raise_if_cancelled()
             if stats.get(match_id, 0.0) >= self.min_similarity:
+                if tracker:
+                    tracker.advance()
                 continue
             if tokens:
                 key = " ".join(sorted(tokens))
             else:
                 key = product.name.lower()
             buckets[key].append((match_id, product))
+            if tracker:
+                tracker.advance()
 
         groups: List[ComparisonGroup] = []
         for key, items in buckets.items():

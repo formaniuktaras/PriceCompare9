@@ -26,6 +26,7 @@ from typing import (
 
 from .comparison_engine import ComparisonBuilder, ComparisonGroup, SupplierMatch
 from .comparison_state import ComparisonStateStore
+from .config import load_config
 from .io import MissingRequiredColumnsError, PriceListExporter, PriceListImporter
 from .model_templates import ModelTemplatesEditor
 from .models import PriceList, Product
@@ -34,6 +35,9 @@ from .search import ProductSearch
 from .tagging import Tagger
 from . import tags_assignment
 from .templates import ImportTemplate, ImportTemplateStore
+from .progress import ProgressTracker
+from .progress_window import run_with_worker_pool
+from export_pipeline.cli import DEFAULT_CHANNEL, ExportResult, run_export
 
 if TYPE_CHECKING:
     from .synonyms_manager import SynonymsManager
@@ -159,18 +163,27 @@ class PriceCompareApp(tk.Tk):
         self.search_tab = ttk.Frame(container)
         self.tags_tab = ttk.Frame(container)
         self.compare_tab = ttk.Frame(container)
+        self.export_tab = ExportTab(
+            container,
+            default_config_path=self._default_config_path(),
+        )
 
         container.add(self.main_price_tab, text="Основний прайс")
         container.add(self.catalog_tab, text="Каталог постачальників")
         container.add(self.search_tab, text="Пошук")
         container.add(self.tags_tab, text="Мітки")
         container.add(self.compare_tab, text="Порівняння")
+        container.add(self.export_tab, text="Експорт")
 
         self._build_main_price_tab()
         self._build_catalog_tab()
         self._build_search_tab()
         self._build_tags_tab()
         self._build_compare_tab()
+
+    def _default_config_path(self) -> Path:
+        package_root = Path(__file__).resolve().parent.parent
+        return (package_root / "config.yaml").resolve()
 
     def _set_links_button_state(self, enabled: bool) -> None:
         if self._catalog_links_button is None:
@@ -612,28 +625,39 @@ class PriceCompareApp(tk.Tk):
         self._set_links_button_state(False)
         self.comparison_board.set_busy(True)
 
-        def on_success(rows: Sequence[ComparisonRow]) -> None:
+        def finalize_refresh(*, stale: bool) -> None:
             self._comparison_refresh_in_progress = False
-            self.comparison_board.refresh(rows=rows)
             self.comparison_board.set_busy(False)
+            if stale:
+                self.comparison_board.mark_stale()
             self._set_links_button_state(bool(self.price_lists or self.store_price_list))
 
+        def on_success(rows: Sequence[ComparisonRow]) -> None:
+            self.comparison_board.refresh(rows=rows)
+            finalize_refresh(stale=False)
+
         def on_error(exc: Exception) -> None:
-            self._comparison_refresh_in_progress = False
-            self.comparison_board.set_busy(False)
-            self.comparison_board.mark_stale()
-            self._set_links_button_state(bool(self.price_lists or self.store_price_list))
+            finalize_refresh(stale=True)
             messagebox.showerror(
                 "Оновлення зв'язків",
                 f"Не вдалося оновити співставлення: {exc}",
             )
 
-        self._run_background_task(
+        def on_cancel() -> None:
+            finalize_refresh(stale=True)
+
+        tracker = ProgressTracker()
+        run_with_worker_pool(
+            master=self,
             title="Оновлення зв'язків",
-            message="Будь ласка, зачекайте. Виконується оновлення співставлень прайсів…",
-            task=self.comparison_board.build_rows,
+            tracker=tracker,
+            job=lambda executor, progress: self.comparison_board.build_rows(
+                tracker=progress
+            ),
             on_success=on_success,
             on_error=on_error,
+            on_cancel=on_cancel,
+            poll_interval_ms=350,
         )
 
     def refresh_data(self, *, mark_comparisons_stale: bool = True) -> None:
@@ -3022,6 +3046,236 @@ class TagsTab(ttk.Frame):
         tags_assignment.validate_tags([assignment], self.templates)
         self._update_tree()
 
+
+class ExportTab(ttk.Frame):
+    """Tab for running the export pipeline from the GUI."""
+
+    def __init__(self, master: tk.Misc, *, default_config_path: Path) -> None:
+        super().__init__(master)
+        self.default_config_path = Path(default_config_path)
+        self.config_path_var = tk.StringVar(value=str(self.default_config_path))
+        self.channel_var = tk.StringVar(value=DEFAULT_CHANNEL)
+        self.selling_type_var = tk.StringVar(value="r")
+        self.format_vars: dict[str, tk.BooleanVar] = {
+            "csv": tk.BooleanVar(value=True),
+            "xlsx": tk.BooleanVar(value=True),
+            "xml": tk.BooleanVar(value=True),
+        }
+        self.status_var = tk.StringVar(value="Готово")
+        self._last_result: ExportResult | None = None
+
+        self._format_checks: list[ttk.Checkbutton] = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        header = ttk.Label(
+            self,
+            text="Формуйте файл імпорту та синхронізуйте вкладки Google Sheets",
+            anchor=tk.W,
+        )
+        header.pack(fill=tk.X, padx=12, pady=(12, 4))
+
+        config_frame = ttk.Frame(self, padding=(12, 0))
+        config_frame.pack(fill=tk.X)
+
+        ttk.Label(config_frame, text="Файл config.yaml:").grid(row=0, column=0, sticky=tk.W)
+        self.config_entry = ttk.Entry(config_frame, textvariable=self.config_path_var)
+        self.config_entry.grid(row=0, column=1, sticky=tk.EW, padx=(8, 0))
+        self.choose_button = ttk.Button(
+            config_frame,
+            text="Обрати…",
+            command=self._choose_config,
+            width=16,
+        )
+        self.choose_button.grid(row=0, column=2, padx=(8, 0), sticky=tk.W)
+        config_frame.columnconfigure(1, weight=1)
+
+        options = ttk.Frame(self, padding=(12, 8))
+        options.pack(fill=tk.X)
+
+        ttk.Label(options, text="Канал:").grid(row=0, column=0, sticky=tk.W)
+        self.channel_combo = ttk.Combobox(
+            options,
+            textvariable=self.channel_var,
+            values=[DEFAULT_CHANNEL],
+            state="readonly",
+            width=14,
+        )
+        self.channel_combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 24))
+
+        ttk.Label(options, text="Selling type (XML):").grid(row=0, column=2, sticky=tk.W)
+        self.selling_type_entry = ttk.Entry(options, textvariable=self.selling_type_var, width=6)
+        self.selling_type_entry.grid(row=0, column=3, sticky=tk.W, padx=(8, 0))
+        options.columnconfigure(4, weight=1)
+
+        formats_frame = ttk.LabelFrame(self, text="Формати експорту", padding=12)
+        formats_frame.pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        for idx, fmt in enumerate(["csv", "xlsx", "xml"]):
+            check = ttk.Checkbutton(
+                formats_frame,
+                text=fmt.upper(),
+                variable=self.format_vars[fmt],
+            )
+            check.grid(row=0, column=idx, padx=(0, 12), sticky=tk.W)
+            self._format_checks.append(check)
+        formats_frame.columnconfigure(len(self._format_checks), weight=1)
+
+        controls = ttk.Frame(self, padding=(12, 0))
+        controls.pack(fill=tk.X)
+
+        self.run_button = ttk.Button(controls, text="Запустити експорт", command=self._on_run)
+        self.run_button.pack(side=tk.LEFT)
+
+        ttk.Button(controls, text="Очистити лог", command=self._clear_log).pack(side=tk.RIGHT)
+        ttk.Label(controls, textvariable=self.status_var).pack(side=tk.RIGHT, padx=(0, 12))
+
+        log_frame = ttk.LabelFrame(self, text="Журнал виконання", padding=0)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 12))
+
+        self.log_text = tk.Text(log_frame, height=16, wrap="word", state=tk.DISABLED)
+        scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _choose_config(self) -> None:
+        initial = self.config_path_var.get()
+        path = filedialog.askopenfilename(
+            title="Оберіть config.yaml",
+            initialfile=initial if initial else None,
+            filetypes=[("YAML", "*.yaml *.yml"), ("Усі файли", "*.*")],
+        )
+        if path:
+            self.config_path_var.set(path)
+
+    def _clear_log(self) -> None:
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _log(self, message: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _selected_formats(self) -> list[str]:
+        return [fmt for fmt, var in self.format_vars.items() if var.get()]
+
+    def _set_running(self, running: bool) -> None:
+        if running:
+            self.run_button.state(["disabled"])
+            self.choose_button.state(["disabled"])
+            self.channel_combo.configure(state="disabled")
+            self.selling_type_entry.configure(state=tk.DISABLED)
+            self.config_entry.configure(state=tk.DISABLED)
+            for check in self._format_checks:
+                check.state(["disabled"])
+        else:
+            self.run_button.state(["!disabled"])
+            self.choose_button.state(["!disabled"])
+            self.channel_combo.configure(state="readonly")
+            self.selling_type_entry.configure(state=tk.NORMAL)
+            self.config_entry.configure(state=tk.NORMAL)
+            for check in self._format_checks:
+                check.state(["!disabled"])
+
+    def _on_run(self) -> None:
+        config_path = Path(self.config_path_var.get()).expanduser()
+        if not config_path.exists():
+            messagebox.showerror("Експорт", f"Файл конфігурації не знайдено: {config_path}")
+            return
+
+        formats = self._selected_formats()
+        if not formats:
+            messagebox.showwarning("Експорт", "Оберіть хоча б один формат експорту")
+            return
+
+        selling_type = self.selling_type_var.get().strip() or "r"
+        self.selling_type_var.set(selling_type)
+        channel = self.channel_var.get() or DEFAULT_CHANNEL
+
+        summary = ", ".join(fmt.upper() for fmt in formats)
+        self._log(f"Старт експорту: канал {channel}, формати {summary}")
+        self.status_var.set("Виконується…")
+        self._set_running(True)
+
+        tracker = ProgressTracker()
+
+        def job(_executor, progress_tracker: ProgressTracker):
+            resolved_config = config_path.resolve()
+            messages: list[str] = [f"Файл конфігурації: {resolved_config}"]
+            load_config.cache_clear()
+            cfg = load_config(resolved_config)
+
+            total_steps = 3 + len(formats)
+            if cfg.sheets:
+                total_steps += 1
+            progress_tracker.reset(total=max(total_steps, 1))
+
+            def log_message(msg: str) -> None:
+                messages.append(msg)
+
+            def progress_step(_name: str, amount: int) -> None:
+                progress_tracker.advance(amount)
+
+            def check_cancel() -> None:
+                progress_tracker.wait_if_paused()
+                progress_tracker.raise_if_cancelled()
+
+            check_cancel()
+            result = run_export(
+                cfg,
+                channel,
+                formats,
+                selling_type,
+                progress=progress_step,
+                log=log_message,
+                check_cancel=check_cancel,
+            )
+            return result, messages
+
+        def on_success(payload: tuple[ExportResult, list[str]]) -> None:
+            result, messages = payload
+            self._last_result = result
+            for message in messages:
+                self._log(message)
+            if result.created_files:
+                for path in result.created_files:
+                    self._log(f"✔ {path}")
+                messagebox.showinfo(
+                    "Експорт",
+                    "Експорт завершено успішно.\n" + "\n".join(str(path) for path in result.created_files),
+                )
+            else:
+                self._log("Не створено жодного файлу.")
+                messagebox.showinfo("Експорт", "Експорт завершено: немає файлів для запису")
+            self.status_var.set("Готово")
+            self._set_running(False)
+
+        def on_error(exc: Exception) -> None:
+            self._log(f"Помилка: {exc}")
+            self.status_var.set("Помилка")
+            self._set_running(False)
+            messagebox.showerror("Експорт", f"Не вдалося виконати експорт: {exc}")
+
+        def on_cancel() -> None:
+            self._log("Операцію скасовано")
+            self.status_var.set("Скасовано")
+            self._set_running(False)
+
+        run_with_worker_pool(
+            master=self.winfo_toplevel(),
+            title="Експорт",
+            tracker=tracker,
+            job=job,
+            on_success=on_success,
+            on_error=on_error,
+            on_cancel=on_cancel,
+        )
+
     def _on_tree_click(self, event: tk.Event[tk.Misc]) -> str | None:  # type: ignore[name-defined]
         region = self.tree.identify_region(event.x, event.y)
         if region != "cell":
@@ -3095,14 +3349,6 @@ class ComparisonBoard(ttk.Frame):
         ("pending", "Непідтверджені"),
     )
 
-    SORT_OPTIONS = (
-        ("name", "Назва (мій товар)"),
-        ("sku", "SKU (мій товар)"),
-        ("price", "Ціна (мій товар)"),
-        ("supplier_name", "Назва (постачальник)"),
-        ("supplier_price", "Ціна (постачальник)"),
-    )
-
     def __init__(
         self,
         master: tk.Misc,
@@ -3128,20 +3374,19 @@ class ComparisonBoard(ttk.Frame):
         self._checkbox_meta: Dict[str, str] = {}
 
         self.search_var = tk.StringVar()
-        self.threshold_var = tk.DoubleVar(value=0.6)
         self.filter_var = tk.StringVar(value="all")
-        self.sort_var = tk.StringVar(value="name")
 
         self._filter_label_to_key = {label: key for key, label in self.FILTER_OPTIONS}
-        self._sort_label_to_key = {label: key for key, label in self.SORT_OPTIONS}
 
         self.filter_label_var = tk.StringVar(value=self._label_for_filter("all"))
-        self.sort_label_var = tk.StringVar(value=self._label_for_sort("name"))
-        self.threshold_display_var = tk.StringVar(value="60%")
         self.status_var = tk.StringVar(value="")
         self._busy = False
         self._stale = False
         self._action_buttons: List[ttk.Button] = []
+
+        self.similarity_threshold = 0.6
+        self._sort_column = "my_name"
+        self._sort_reverse = False
 
         self._build_ui()
         self.refresh()
@@ -3155,14 +3400,16 @@ class ComparisonBoard(ttk.Frame):
         self._ordered_rows = computed_rows
         self._rows = {row.row_id: row for row in self._ordered_rows}
         self._selection = {row.row_id: (row.row_id in previous_selection) for row in self._ordered_rows}
+        self._sort_rows()
         self._apply_filters()
         self.clear_stale()
 
     def refresh_view(self) -> None:
+        self._sort_rows()
         self._apply_filters()
 
-    def build_rows(self) -> List[ComparisonRow]:
-        return self._rebuild_rows()
+    def build_rows(self, tracker: ProgressTracker | None = None) -> List[ComparisonRow]:
+        return self._rebuild_rows(tracker=tracker)
 
     def mark_stale(self) -> None:
         self._stale = True
@@ -3225,22 +3472,8 @@ class ComparisonBoard(ttk.Frame):
 
         ttk.Label(controls, text="Пошук (назва/SKU):").grid(row=0, column=0, sticky=tk.W, padx=(0, 6))
         search_entry = ttk.Entry(controls, textvariable=self.search_var)
-        search_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 12))
+        search_entry.grid(row=0, column=1, sticky=tk.EW)
         self.search_var.trace_add("write", lambda *_: self._apply_filters())
-
-        ttk.Label(controls, text="Поріг схожості:").grid(row=0, column=2, sticky=tk.W, padx=(0, 6))
-        threshold_scale = ttk.Scale(
-            controls,
-            from_=0.0,
-            to=1.0,
-            orient=tk.HORIZONTAL,
-            variable=self.threshold_var,
-            command=self._on_threshold_change,
-        )
-        threshold_scale.grid(row=0, column=3, sticky=tk.EW, padx=(0, 4))
-        ttk.Label(controls, textvariable=self.threshold_display_var).grid(
-            row=0, column=4, sticky=tk.W
-        )
 
         ttk.Label(controls, text="Фільтр:").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
         filter_combo = ttk.Combobox(
@@ -3253,19 +3486,7 @@ class ComparisonBoard(ttk.Frame):
         filter_combo.grid(row=1, column=1, sticky=tk.W, pady=(8, 0))
         filter_combo.bind("<<ComboboxSelected>>", self._on_filter_selected)
 
-        ttk.Label(controls, text="Сортування:").grid(row=1, column=2, sticky=tk.W, padx=(0, 6), pady=(8, 0))
-        sort_combo = ttk.Combobox(
-            controls,
-            state="readonly",
-            values=list(self._sort_label_to_key.keys()),
-            textvariable=self.sort_label_var,
-            width=28,
-        )
-        sort_combo.grid(row=1, column=3, sticky=tk.W, pady=(8, 0))
-        sort_combo.bind("<<ComboboxSelected>>", self._on_sort_selected)
-
         controls.columnconfigure(1, weight=1)
-        controls.columnconfigure(3, weight=1)
 
         actions = ttk.Frame(self)
         actions.pack(fill=tk.X, padx=8, pady=(0, 6))
@@ -3320,7 +3541,7 @@ class ComparisonBoard(ttk.Frame):
             selectmode="none",
         )
 
-        headings = {
+        self._column_headings = {
             "my_sku": "Мій SKU",
             "my_name": "Назва (мій товар)",
             "my_tags": "Мітки",
@@ -3351,7 +3572,11 @@ class ComparisonBoard(ttk.Frame):
             "checkbox": tk.CENTER,
         }
         for column in columns:
-            self.tree.heading(column, text=headings[column])
+            self.tree.heading(
+                column,
+                text=self._column_headings[column],
+                command=partial(self._on_heading_click, column),
+            )
             self.tree.column(
                 column,
                 width=widths[column],
@@ -3374,11 +3599,12 @@ class ComparisonBoard(ttk.Frame):
         self.tree.tag_configure("match-none", background="")
 
         self.tree.bind("<Button-1>", self._on_tree_click)
+        self._update_heading_sort_indicators()
 
     # ------------------------------------------------------------------
     # Data preparation
     # ------------------------------------------------------------------
-    def _rebuild_rows(self) -> List[ComparisonRow]:
+    def _rebuild_rows(self, tracker: ProgressTracker | None = None) -> List[ComparisonRow]:
         store_products = list(self.get_store_products())
         supplier_lists = list(self.get_supplier_lists())
 
@@ -3387,14 +3613,20 @@ class ComparisonBoard(ttk.Frame):
             supplier_lists,
             min_similarity=self.min_similarity,
         )
-        groups = self._sort_groups(builder.build())
+        groups = self._sort_groups(builder.build(tracker=tracker))
 
         rows: List[ComparisonRow] = []
         valid_pairs: List[tuple[str, str]] = []
         for group in groups:
+            if tracker:
+                tracker.wait_if_paused()
+                tracker.raise_if_cancelled()
             group_type = "supplier-only" if group.store_product is None else "store"
             if group.supplier_matches:
                 for match in group.supplier_matches:
+                    if tracker:
+                        tracker.wait_if_paused()
+                        tracker.raise_if_cancelled()
                     valid_pairs.append((group.group_id, match.match_id))
                     status = self.state_store.status_for(group.group_id, match.match_id)
                     if status == "removed":
@@ -3437,8 +3669,6 @@ class ComparisonBoard(ttk.Frame):
         return rows
 
     def _sort_groups(self, groups: List[ComparisonGroup]) -> List[ComparisonGroup]:
-        key = self.sort_var.get()
-
         def store_name(group: ComparisonGroup) -> str:
             if group.store_product:
                 return group.store_product.name.lower()
@@ -3468,25 +3698,111 @@ class ComparisonBoard(ttk.Frame):
                 return min(match.product.price for match in group.supplier_matches)
             return float("inf")
 
-        if key == "sku":
-            return sorted(groups, key=lambda group: (store_sku(group), store_name(group)))
-        if key == "price":
-            return sorted(groups, key=lambda group: (store_price_value(group), store_name(group)))
-        if key == "supplier_name":
-            return sorted(groups, key=lambda group: supplier_name(group))
-        if key == "supplier_price":
-            return sorted(
-                groups,
-                key=lambda group: (supplier_price_value(group), supplier_name(group)),
-            )
-        return sorted(groups, key=lambda group: store_name(group))
+        return sorted(
+            groups,
+            key=lambda group: (
+                store_name(group),
+                store_sku(group),
+                store_price_value(group),
+                supplier_name(group),
+                supplier_price_value(group),
+            ),
+        )
+
+    def _on_heading_click(self, column: str) -> None:
+        if column == self._sort_column:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_column = column
+            self._sort_reverse = False
+
+        try:
+            yview_start = self.tree.yview()[0]
+        except tk.TclError:
+            yview_start = None
+
+        self._sort_rows()
+        self._apply_filters(preserve_scroll=yview_start)
+
+    def _sort_rows(self) -> None:
+        key_column = self._sort_column
+
+        keyed_rows: List[tuple[object, str]] = []
+        missing_rows: List[str] = []
+        for row in self._ordered_rows:
+            value, missing = self._sort_key_for_column(row, key_column)
+            if missing:
+                missing_rows.append(row.row_id)
+            else:
+                keyed_rows.append((value, row.row_id))
+
+        keyed_rows.sort(key=lambda item: (item[0], item[1]), reverse=self._sort_reverse)
+        sorted_ids = [row_id for _value, row_id in keyed_rows]
+        sorted_ids.extend(missing_rows)
+        self._ordered_rows = [self._rows[row_id] for row_id in sorted_ids]
+        self._update_heading_sort_indicators()
+
+    def _sort_key_for_column(self, row: ComparisonRow, column: str) -> tuple[object, bool]:
+        store_product = row.store_product
+        supplier_product = row.supplier_product
+
+        if column == "my_sku":
+            value = (store_product.sku or "") if store_product else ""
+            missing = not bool(value)
+            return value.lower(), missing
+        if column == "my_name":
+            value = (store_product.name or "") if store_product else ""
+            missing = not bool(value)
+            return value.lower(), missing
+        if column == "my_tags":
+            tags = sorted(store_product.tags) if store_product else []
+            value = ", ".join(tags)
+            missing = not bool(value)
+            return value.lower(), missing
+        if column == "my_price":
+            value = store_product.price if store_product else None
+            missing = value is None
+            return (value if value is not None else 0.0), missing
+        if column == "supplier":
+            value = (supplier_product.supplier or "") if supplier_product else ""
+            missing = not bool(value)
+            return value.lower(), missing
+        if column == "supplier_name":
+            value = (supplier_product.name or "") if supplier_product else ""
+            missing = not bool(value)
+            return value.lower(), missing
+        if column == "supplier_tags":
+            tags = sorted(supplier_product.tags) if supplier_product else []
+            value = ", ".join(tags)
+            missing = not bool(value)
+            return value.lower(), missing
+        if column == "supplier_price":
+            value = supplier_product.price if supplier_product else None
+            missing = value is None
+            return (value if value is not None else 0.0), missing
+        if column == "similarity":
+            value = row.similarity if row.supplier_match else None
+            missing = value is None
+            return (value if value is not None else 0.0), missing
+        if column == "checkbox":
+            value = bool(self._selection.get(row.row_id, False))
+            return value, False
+        return row.row_id, False
+
+    def _update_heading_sort_indicators(self) -> None:
+        for column, base_text in self._column_headings.items():
+            text = base_text
+            if column == self._sort_column:
+                arrow = "↓" if self._sort_reverse else "↑"
+                text = f"{base_text} {arrow}"
+            self.tree.heading(column, text=text, command=partial(self._on_heading_click, column))
 
     # ------------------------------------------------------------------
     # Filtering helpers
     # ------------------------------------------------------------------
-    def _apply_filters(self) -> None:
+    def _apply_filters(self, *, preserve_scroll: float | None = None) -> None:
         filtered = [row for row in self._ordered_rows if self._passes_filters(row)]
-        self._populate_tree(filtered)
+        self._populate_tree(filtered, preserve_scroll=preserve_scroll)
 
     def _passes_filters(self, row: ComparisonRow) -> bool:
         return (
@@ -3546,14 +3862,16 @@ class ComparisonBoard(ttk.Frame):
     def _passes_threshold(self, row: ComparisonRow) -> bool:
         if not row.supplier_match:
             return True
-        threshold = float(self.threshold_var.get())
-        return row.similarity >= threshold
+        return row.similarity >= self.similarity_threshold
 
     # ------------------------------------------------------------------
     # Tree rendering
     # ------------------------------------------------------------------
-    def _populate_tree(self, rows: Sequence[ComparisonRow]) -> None:
-        for item in self.tree.get_children():
+    def _populate_tree(
+        self, rows: Sequence[ComparisonRow], *, preserve_scroll: float | None = None
+    ) -> None:
+        previous_items = self.tree.get_children()
+        for item in previous_items:
             self.tree.delete(item)
 
         self._item_to_row.clear()
@@ -3566,6 +3884,15 @@ class ComparisonBoard(ttk.Frame):
             self._checkbox_meta[row.row_id] = row.data_sku
             checkbox_symbol = "☑" if self._selection.get(row.row_id) else "☐"
             self.tree.set(item, "checkbox", checkbox_symbol)
+
+        if preserve_scroll is not None:
+            def restore() -> None:
+                try:
+                    self.tree.yview_moveto(preserve_scroll)
+                except tk.TclError:
+                    pass
+
+            self.after_idle(restore)
 
     def _row_values(self, row: ComparisonRow) -> tuple[str, ...]:
         store_product = row.store_product
@@ -3630,6 +3957,13 @@ class ComparisonBoard(ttk.Frame):
         new_state = not current
         self._selection[row_id] = new_state
         self.tree.set(item, "checkbox", "☑" if new_state else "☐")
+        if self._sort_column == "checkbox":
+            try:
+                yview_start = self.tree.yview()[0]
+            except tk.TclError:
+                yview_start = None
+            self._sort_rows()
+            self._apply_filters(preserve_scroll=yview_start)
 
     def _confirm_selected(self) -> None:
         changed = False
@@ -3686,20 +4020,6 @@ class ComparisonBoard(ttk.Frame):
         key = self._filter_label_to_key.get(label, "all")
         self._set_filter(key)
 
-    def _on_sort_selected(self, _event: tk.Event | None = None) -> None:
-        label = self.sort_label_var.get()
-        key = self._sort_label_to_key.get(label, "name")
-        self.sort_var.set(key)
-        self.refresh()
-
-    def _on_threshold_change(self, value: str) -> None:
-        try:
-            numeric = float(value)
-        except ValueError:
-            numeric = float(self.threshold_var.get())
-        self.threshold_display_var.set(f"{numeric * 100:.0f}%")
-        self._apply_filters()
-
     def _set_filter(self, key: str) -> None:
         self.filter_var.set(key)
         self.filter_label_var.set(self._label_for_filter(key))
@@ -3707,9 +4027,6 @@ class ComparisonBoard(ttk.Frame):
 
     def _label_for_filter(self, key: str) -> str:
         return next((label for option, label in self.FILTER_OPTIONS if option == key), self.FILTER_OPTIONS[0][1])
-
-    def _label_for_sort(self, key: str) -> str:
-        return next((label for option, label in self.SORT_OPTIONS if option == key), self.SORT_OPTIONS[0][1])
 
 class AutoUpdateDialog(tk.Toplevel):
     SOURCE_OPTIONS = (
