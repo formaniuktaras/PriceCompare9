@@ -22,7 +22,7 @@
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt  # якщо потрібно, але проєкт працює на стандартній бібліотеці
-pip install openpyxl  # необхідно для імпорту/експорту Excel
+pip install pandas openpyxl gspread gspread_dataframe
 ```
 
 ## Запуск
@@ -41,6 +41,49 @@ python main.py
 У будь-якій вкладці доступний експорт у CSV/JSON/XML/Excel. Для імпорту використовуйте кнопки «Імпорт прайсу» та оберіть потрібний файл (`.csv`, `.json`, `.xml` або `.xlsx`). За потреби додатково вкажіть правила авто-тегування (див. нижче).
 
 У репозиторії містяться приклади CSV-файлів `sample_supplier_a.csv` та `sample_supplier_b.csv`, які можна використати для швидкого тестування застосунку.
+
+## Налаштування експорту у Google Sheets та Prom
+
+1. Вкажіть ідентифікатор Google Spreadsheet у `config.yaml` (секція `sheets.spreadsheet_id`).
+2. Налаштуйте сервісний акаунт для Google API та збережіть JSON з ключами. Створіть змінну середовища `GOOGLE_APPLICATION_CREDENTIALS` із шляхом до цього файлу, або покладіть його у корінь проєкту під назвою `service_account.json` — `gspread` знайде його автоматично.
+3. За потреби змініть директорію для готових файлів експорту (`exports.output_dir`). За замовчуванням файли зберігаються у `./exports`.
+
+### Формування вкладок Export_Staging / Export_Prom
+
+CLI-команда будує нормалізовані таблиці та оновлює два аркуші у Google Sheets:
+
+```bash
+python -m export_pipeline.cli export --channel prom --format csv
+```
+
+- У Spreadsheet автоматично з'являться (або оновляться) вкладки `Export_Staging` та `Export_Prom`.
+- Значення записуються як plain-text без формул, тому Google-файли можна одразу передавати менеджерам або завантажувати як CSV.
+
+Щоб перевірити роботу без підключення до Google, запустіть команду у середовищі без `gspread` — оновлення аркушів пропуститься з попереджувальним повідомленням, але локальні файли сформуються.
+
+### Експорт у CSV/XLSX/XML
+
+Команда `export` приймає один або кілька форматів:
+
+```bash
+python -m export_pipeline.cli export --channel prom --format csv xlsx xml
+```
+
+- CSV та XLSX зберігаються з іменем `prom_export_YYYYMMDD_HHMM.*`.
+- XML для Price.ua отримує назву `priceua_YYYYMMDD_HHMM.xml` і містить не більше 10 тегів `<image>` на товар, коректно виставлені `available`, `in_stock`, `priceuah` та екрановані спецсимволи.
+- Абсолютні шляхи до створених файлів друкуються у stdout.
+
+Для швидкого тесту використовується файл `tests/data/sample_raw.csv`. Ви можете підмінити його власними даними або покласти `export_raw.csv` до директорії `data_root`, вказаної у конфігурації.
+
+### Makefile
+
+Передбачено спрощену перевірку експорту:
+
+```bash
+make test-export
+```
+
+Команда запускає XML-експорт для Prom та перевіряє появу файлу `exports/priceua_*.xml`.
 
 ## Налаштування зіставлення колонок
 
