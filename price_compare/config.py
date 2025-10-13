@@ -7,7 +7,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
-import yaml
+try:  # pragma: no cover - exercised implicitly when PyYAML is available
+    import yaml  # type: ignore[assignment]
+except ModuleNotFoundError:  # pragma: no cover - exercised when PyYAML is missing
+    from . import simple_yaml as yaml
 
 
 @dataclass(frozen=True)
