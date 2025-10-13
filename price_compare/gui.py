@@ -34,6 +34,8 @@ from .search import ProductSearch
 from .tagging import Tagger
 from . import tags_assignment
 from .templates import ImportTemplate, ImportTemplateStore
+from .progress import ProgressTracker
+from .progress_window import run_with_worker_pool
 
 if TYPE_CHECKING:
     from .synonyms_manager import SynonymsManager
@@ -612,28 +614,39 @@ class PriceCompareApp(tk.Tk):
         self._set_links_button_state(False)
         self.comparison_board.set_busy(True)
 
-        def on_success(rows: Sequence[ComparisonRow]) -> None:
+        def finalize_refresh(*, stale: bool) -> None:
             self._comparison_refresh_in_progress = False
-            self.comparison_board.refresh(rows=rows)
             self.comparison_board.set_busy(False)
+            if stale:
+                self.comparison_board.mark_stale()
             self._set_links_button_state(bool(self.price_lists or self.store_price_list))
 
+        def on_success(rows: Sequence[ComparisonRow]) -> None:
+            self.comparison_board.refresh(rows=rows)
+            finalize_refresh(stale=False)
+
         def on_error(exc: Exception) -> None:
-            self._comparison_refresh_in_progress = False
-            self.comparison_board.set_busy(False)
-            self.comparison_board.mark_stale()
-            self._set_links_button_state(bool(self.price_lists or self.store_price_list))
+            finalize_refresh(stale=True)
             messagebox.showerror(
                 "Оновлення зв'язків",
                 f"Не вдалося оновити співставлення: {exc}",
             )
 
-        self._run_background_task(
+        def on_cancel() -> None:
+            finalize_refresh(stale=True)
+
+        tracker = ProgressTracker()
+        run_with_worker_pool(
+            master=self,
             title="Оновлення зв'язків",
-            message="Будь ласка, зачекайте. Виконується оновлення співставлень прайсів…",
-            task=self.comparison_board.build_rows,
+            tracker=tracker,
+            job=lambda executor, progress: self.comparison_board.build_rows(
+                tracker=progress
+            ),
             on_success=on_success,
             on_error=on_error,
+            on_cancel=on_cancel,
+            poll_interval_ms=350,
         )
 
     def refresh_data(self, *, mark_comparisons_stale: bool = True) -> None:
@@ -3154,8 +3167,8 @@ class ComparisonBoard(ttk.Frame):
         self._sort_rows()
         self._apply_filters()
 
-    def build_rows(self) -> List[ComparisonRow]:
-        return self._rebuild_rows()
+    def build_rows(self, tracker: ProgressTracker | None = None) -> List[ComparisonRow]:
+        return self._rebuild_rows(tracker=tracker)
 
     def mark_stale(self) -> None:
         self._stale = True
@@ -3350,7 +3363,7 @@ class ComparisonBoard(ttk.Frame):
     # ------------------------------------------------------------------
     # Data preparation
     # ------------------------------------------------------------------
-    def _rebuild_rows(self) -> List[ComparisonRow]:
+    def _rebuild_rows(self, tracker: ProgressTracker | None = None) -> List[ComparisonRow]:
         store_products = list(self.get_store_products())
         supplier_lists = list(self.get_supplier_lists())
 
@@ -3359,14 +3372,20 @@ class ComparisonBoard(ttk.Frame):
             supplier_lists,
             min_similarity=self.min_similarity,
         )
-        groups = self._sort_groups(builder.build())
+        groups = self._sort_groups(builder.build(tracker=tracker))
 
         rows: List[ComparisonRow] = []
         valid_pairs: List[tuple[str, str]] = []
         for group in groups:
+            if tracker:
+                tracker.wait_if_paused()
+                tracker.raise_if_cancelled()
             group_type = "supplier-only" if group.store_product is None else "store"
             if group.supplier_matches:
                 for match in group.supplier_matches:
+                    if tracker:
+                        tracker.wait_if_paused()
+                        tracker.raise_if_cancelled()
                     valid_pairs.append((group.group_id, match.match_id))
                     status = self.state_store.status_for(group.group_id, match.match_id)
                     if status == "removed":
