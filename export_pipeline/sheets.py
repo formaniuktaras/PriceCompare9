@@ -32,34 +32,39 @@ def _open_spreadsheet(spreadsheet_id: str):  # pragma: no cover - thin wrapper
     return client.open_by_key(spreadsheet_id)
 
 
+def _upsert_headers(worksheet, headers: Iterable[str]) -> None:
+    if not headers:
+        return
+    header_row = list(headers)
+    try:
+        existing = worksheet.row_values(1)
+    except Exception:  # pragma: no cover - network interaction
+        existing = []
+    if existing[: len(header_row)] != header_row:
+        worksheet.update("1:1", [header_row])  # pragma: no cover - network interaction
+
+
 def ensure_sheet(spreadsheet_id: str, title: str, headers: Iterable[str]) -> None:
     """Ensure the given sheet exists and has headers in the first row."""
 
+    spreadsheet = _open_spreadsheet(spreadsheet_id)
     try:
-        spreadsheet = _open_spreadsheet(spreadsheet_id)
-        spreadsheet.worksheet(title)
-    except RuntimeError as exc:
-        LOGGER.warning("Skipping sheet ensure for %s/%s: %s", spreadsheet_id, title, exc)
-        return
+        worksheet = spreadsheet.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:  # type: ignore[attr-defined]
-        worksheet = spreadsheet.add_worksheet(title=title, rows="1000", cols="26")
-        if headers:
-            worksheet.update("1:1", [list(headers)])
-    else:
-        # Sheet exists; nothing else to do.
-        pass
+        LOGGER.info("Creating worksheet %s in spreadsheet %s", title, spreadsheet_id)
+        worksheet = spreadsheet.add_worksheet(title=title, rows=1000, cols=26)
+    _upsert_headers(worksheet, headers)
 
 
 def write_df(spreadsheet_id: str, title: str, df: pd.DataFrame) -> None:
     """Write the dataframe values into the given sheet."""
 
+    spreadsheet = _open_spreadsheet(spreadsheet_id)
     try:
-        spreadsheet = _open_spreadsheet(spreadsheet_id)
-    except RuntimeError as exc:
-        LOGGER.warning("Skipping sheet write for %s/%s: %s", spreadsheet_id, title, exc)
-        return
-
-    worksheet = spreadsheet.worksheet(title)
+        worksheet = spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:  # type: ignore[attr-defined]
+        ensure_sheet(spreadsheet_id, title, list(df.columns))
+        worksheet = spreadsheet.worksheet(title)
     set_with_dataframe(worksheet, df, include_index=False, include_column_header=True, resize=True)
 
 
