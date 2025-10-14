@@ -3046,6 +3046,42 @@ class TagsTab(ttk.Frame):
         tags_assignment.validate_tags([assignment], self.templates)
         self._update_tree()
 
+    def _on_tree_click(self, event: tk.Event[tk.Misc]) -> str | None:  # type: ignore[name-defined]
+        region = self.tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return None
+        column = self.tree.identify_column(event.x)
+        if column != "#6":
+            return None
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return None
+        self.tree.selection_set(item)
+        self._toggle_apply(item)
+        return "break"
+
+    def _toggle_apply(self, item: str) -> None:
+        key = self._item_to_key.get(item)
+        if not key:
+            return
+        assignment = self.assignments.get(key)
+        if not assignment:
+            return
+
+        auto_pending = assignment.auto_tags & assignment.proposed_tags
+        if not auto_pending:
+            auto_pending = set(assignment.proposed_tags)
+        if not auto_pending:
+            return
+
+        if auto_pending <= assignment.selected_tags:
+            assignment.selected_tags.difference_update(auto_pending)
+        else:
+            assignment.selected_tags.update(auto_pending)
+
+        tags_assignment.validate_tags([assignment], self.templates)
+        self._update_tree()
+
 
 class ExportTab(ttk.Frame):
     """Tab for running the export pipeline from the GUI."""
@@ -3275,42 +3311,6 @@ class ExportTab(ttk.Frame):
             on_error=on_error,
             on_cancel=on_cancel,
         )
-
-    def _on_tree_click(self, event: tk.Event[tk.Misc]) -> str | None:  # type: ignore[name-defined]
-        region = self.tree.identify_region(event.x, event.y)
-        if region != "cell":
-            return None
-        column = self.tree.identify_column(event.x)
-        if column != "#6":
-            return None
-        item = self.tree.identify_row(event.y)
-        if not item:
-            return None
-        self.tree.selection_set(item)
-        self._toggle_apply(item)
-        return "break"
-
-    def _toggle_apply(self, item: str) -> None:
-        key = self._item_to_key.get(item)
-        if not key:
-            return
-        assignment = self.assignments.get(key)
-        if not assignment:
-            return
-
-        auto_pending = assignment.auto_tags & assignment.proposed_tags
-        if not auto_pending:
-            auto_pending = set(assignment.proposed_tags)
-        if not auto_pending:
-            return
-
-        if auto_pending <= assignment.selected_tags:
-            assignment.selected_tags.difference_update(auto_pending)
-        else:
-            assignment.selected_tags.update(auto_pending)
-
-        tags_assignment.validate_tags([assignment], self.templates)
-        self._update_tree()
 
 @dataclass
 class ComparisonRow:
