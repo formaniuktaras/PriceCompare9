@@ -87,7 +87,13 @@ class ProgressWindow(tk.Toplevel):
         container.pack(fill=tk.BOTH, expand=True)
 
         self.status_var = tk.StringVar(value="Опрацьовано 0/0. Залишилось 0. ETA: — ~0 ел/с")
-        status_label = ttk.Label(container, textvariable=self.status_var, justify=tk.LEFT)
+        status_label = ttk.Label(
+            container,
+            textvariable=self.status_var,
+            justify=tk.LEFT,
+            width=76,
+            anchor=tk.W,
+        )
         status_label.pack(fill=tk.X)
 
         self.progress = ttk.Progressbar(
@@ -141,7 +147,7 @@ class ProgressWindow(tk.Toplevel):
         except tk.TclError:
             pass
 
-        self._schedule_refresh()
+        self._refresh()
 
     # ------------------------------------------------------------------
     # UI actions
