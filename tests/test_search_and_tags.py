@@ -1,3 +1,5 @@
+import re
+
 from price_compare.model_templates import generate_model_pattern
 from price_compare.models import PriceList, Product
 from price_compare.search import ProductSearch
@@ -35,3 +37,11 @@ def test_model_template_fallback_matches_with_extra_words() -> None:
 
     assert "Samsung" in tags
     assert "S23" in tags
+
+
+def test_generate_model_pattern_allows_missing_separators() -> None:
+    pattern = generate_model_pattern("Samsung", "Galaxy S23 FE")
+    regex = re.compile(pattern, re.IGNORECASE)
+
+    assert regex.search("TPU для Samsung GalaxyS23FE (2023)")
+    assert regex.search("Чохол Samsung Galaxy-S23 FE")
