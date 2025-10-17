@@ -16,6 +16,7 @@ class PriceListRepository:
     def __init__(self, data_dir: str | os.PathLike[str] = ".price_compare_data") -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._cache: Dict[str, tuple[float, PriceList]] = {}
 
     def _file_for_supplier(self, supplier: str) -> Path:
         sanitized = supplier.lower().replace(" ", "_")
@@ -77,14 +78,22 @@ class PriceListRepository:
         if not path.exists():
             raise FileNotFoundError(f"No price list stored for supplier '{supplier}'.")
 
+        mtime = path.stat().st_mtime
+        cached = self._cache.get(supplier)
+        if cached and cached[0] == mtime:
+            return cached[1]
+
         payload = self._load_payload(path)
         if payload is None:
             raise FileNotFoundError(f"No price list stored for supplier '{supplier}'.")
 
-        return self._deserialize_price_list(supplier, payload)
+        price_list = self._deserialize_price_list(supplier, payload)
+        self._cache[supplier] = (mtime, price_list)
+        return price_list
 
     def load_all(self) -> Dict[str, PriceList]:
-        return {supplier: self.load(supplier) for supplier in self.list_suppliers()}
+        suppliers = self.list_suppliers()
+        return {supplier: self.load(supplier) for supplier in suppliers}
 
     def save(self, price_list: PriceList) -> None:
         path = self._file_for_supplier(price_list.supplier)
@@ -106,11 +115,14 @@ class PriceListRepository:
         }
         with path.open("w", encoding="utf-8") as fp:
             json.dump(payload, fp, indent=2, ensure_ascii=False)
+        mtime = path.stat().st_mtime
+        self._cache[price_list.supplier] = (mtime, price_list)
 
     def delete(self, supplier: str) -> None:
         path = self._file_for_supplier(supplier)
         if path.exists():
             path.unlink()
+        self._cache.pop(supplier, None)
 
     def rename(self, old_supplier: str, new_supplier: str) -> None:
         old_path = self._file_for_supplier(old_supplier)
@@ -129,7 +141,10 @@ class PriceListRepository:
             payload["supplier"] = new_supplier
             with new_path.open("w", encoding="utf-8") as fp:
                 json.dump(payload, fp, indent=2, ensure_ascii=False)
+        self._cache.pop(old_supplier, None)
+        self._cache.pop(new_supplier, None)
 
     def clear(self) -> None:
         for supplier in self.list_suppliers():
             self.delete(supplier)
+        self._cache.clear()

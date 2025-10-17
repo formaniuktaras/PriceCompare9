@@ -29,6 +29,9 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+_TOKEN_PATTERN = re.compile(r"\w+", re.UNICODE)
+
+
 @dataclass
 class ModelTemplate:
     """Represents a compiled model template with metadata and tags."""
@@ -39,11 +42,15 @@ class ModelTemplate:
     pattern: str
     tags: Sequence[str]
 
+    _regex: re.Pattern[str] | None = field(init=False, repr=False)
+    _token_sequence: tuple[str, ...] = field(init=False, repr=False)
+
     def __post_init__(self) -> None:
         try:
-            self._regex: re.Pattern[str] | None = re.compile(self.pattern, re.IGNORECASE)
+            self._regex = re.compile(self.pattern, re.IGNORECASE)
         except re.error:
             self._regex = None
+        self._token_sequence = self._extract_tokens()
 
     def iter_matches(self, text: str) -> Sequence[re.Match[str]]:
         if not self._regex:
@@ -57,6 +64,36 @@ class ModelTemplate:
         if not matches:
             return 0
         return max(len(match.group(0)) for match in matches)
+
+    def token_match_score(self, tokens: Sequence[str]) -> tuple[int, int] | None:
+        """Return (token_count, total_length) if template tokens match in order."""
+
+        if not self._token_sequence or not tokens:
+            return None
+        token_list = list(tokens)
+        start = 0
+        for template_token in self._token_sequence:
+            try:
+                idx = token_list.index(template_token, start)
+            except ValueError:
+                return None
+            start = idx + 1
+        total_length = sum(len(token) for token in self._token_sequence)
+        return len(self._token_sequence), total_length
+
+    def _extract_tokens(self) -> tuple[str, ...]:
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for part in (self.brand, self.name):
+            for token in _TOKEN_PATTERN.findall(str(part).lower()):
+                if token and token not in seen:
+                    seen.add(token)
+                    tokens.append(token)
+        return tuple(tokens)
+
+    @property
+    def token_sequence(self) -> tuple[str, ...]:
+        return self._token_sequence
 
 
 @dataclass
@@ -345,11 +382,20 @@ def find_best_template_match(
     """Return the template that has the longest exact regex match."""
 
     haystack = product_name or ""
-    best: tuple[int, ModelTemplate] | None = None
+    tokens = tuple(_TOKEN_PATTERN.findall(haystack.lower()))
+    best: tuple[tuple[int, int, int], ModelTemplate] | None = None
     for template in templates:
         length = template.match_length(haystack)
-        if length and (best is None or length > best[0]):
-            best = (length, template)
+        if length:
+            score = (1, length, len(template.token_sequence))
+        else:
+            token_match = template.token_match_score(tokens)
+            if not token_match:
+                continue
+            token_count, total_length = token_match
+            score = (0, token_count, total_length)
+        if best is None or score > best[0]:
+            best = (score, template)
     return best[1] if best else None
 
 
