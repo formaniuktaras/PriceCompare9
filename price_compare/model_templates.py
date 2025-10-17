@@ -27,13 +27,35 @@ def _normalize_tags(tags: Iterable[str]) -> List[str]:
 
 
 def generate_model_pattern(brand: str, model: str) -> str:
-    """Generate a safe regular expression for a brand/model combination."""
+    """Generate a flexible regex for matching brand/model combinations.
 
-    full_name = " ".join(part for part in [brand.strip(), model.strip()] if part)
+    The previous implementation escaped the full name verbatim which meant the
+    resulting expression only matched the exact spacing present in the
+    template. Real-world supplier names often omit spaces or replace them with
+    punctuation (for example, ``Samsung GalaxyS23 FE`` or ``Galaxy-S23``).
+
+    To make matching more robust we split the combined brand/model value into
+    tokens and allow any number of non-word separators (including the absence
+    of one) between them. We still keep the leading/trailing word boundaries so
+    that partial matches (like ``S23`` inside ``S230``) are avoided.
+    """
+
+    parts = [str(brand or "").strip(), str(model or "").strip()]
+    full_name = " ".join(part for part in parts if part)
     if not full_name:
         return r""
-    escaped = re.escape(full_name)
-    return rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])"
+
+    # Allow for missing or substituted separators between tokens (spaces,
+    # dashes, underscores, etc.). ``\W`` does not include underscore, so we add
+    # it explicitly to cover identifiers that use it as a separator.
+    tokens = [token for token in re.split(r"\s+", full_name) if token]
+    if not tokens:
+        return r""
+
+    escaped_tokens = [re.escape(token) for token in tokens]
+    flexible_separator = r"[\W_]*"
+    pattern_body = flexible_separator.join(escaped_tokens)
+    return rf"(?<![A-Za-z0-9]){pattern_body}(?![A-Za-z0-9])"
 
 
 @dataclass
