@@ -125,7 +125,6 @@ class PriceListImporter:
 
         supplier_name = supplier or path.stem
         price_list = PriceList(supplier=supplier_name, products=products)
-        price_list.sort_products()
         return price_list
 
     def detect_headers(self, path: str | Path) -> list[str]:
@@ -372,31 +371,35 @@ class PriceListImporter:
             mapping = self._prepare_column_mapping(headers, column_mapping, path)
             used_columns = set(mapping.values())
 
+            extract = self._extract_cell
+            parse_price = self._parse_price
+            default_currency = self.default_currency
+
+            sku_column = mapping["sku"]
+            name_column = mapping["name"]
+            price_column = mapping["price"]
+            currency_column = mapping.get("currency")
+            description_column = mapping.get("description")
+            tags_column = mapping.get("tags")
+
             for row in reader:
-                sku = self._extract_cell(row, mapping["sku"]).strip()
-                name = self._extract_cell(row, mapping["name"]).strip()
-                price_raw = self._extract_cell(row, mapping["price"])
-                price_str = str(price_raw).strip() if price_raw is not None else ""
+                sku = extract(row, sku_column).strip()
+                name = extract(row, name_column).strip()
+                price_raw = extract(row, price_column)
+                price_str = price_raw.strip() if price_raw else ""
 
-                currency_column = mapping.get("currency")
-                currency_value = (
-                    self._extract_cell(row, currency_column) if currency_column else ""
-                )
-                currency = currency_value.strip() or self.default_currency
+                currency_value = extract(row, currency_column) if currency_column else ""
+                currency = currency_value.strip() or default_currency
 
-                description_column = mapping.get("description")
-                description_value = (
-                    self._extract_cell(row, description_column) if description_column else ""
-                )
+                description_value = extract(row, description_column) if description_column else ""
                 description = description_value.strip() or None
 
-                tags_column = mapping.get("tags")
-                tags_raw = self._extract_cell(row, tags_column) if tags_column else ""
+                tags_raw = extract(row, tags_column) if tags_column else ""
 
                 if not sku or not name or not price_str:
                     continue
 
-                price = self._parse_price(price_raw, sku)
+                price = parse_price(price_raw, sku)
 
                 tags = {
                     tag.strip().lower()
@@ -450,6 +453,9 @@ class PriceListImporter:
         )
         used_columns = set(mapping.values())
 
+        parse_price = self._parse_price
+        default_currency = self.default_currency
+
         for item in products_data:
             if not isinstance(item, dict):
                 continue
@@ -477,11 +483,11 @@ class PriceListImporter:
             if not sku or not name or not price_str:
                 continue
 
-            price = self._parse_price(price_raw, sku)
+            price = parse_price(price_raw, sku)
 
             currency_value = _get("currency")
             currency = str(currency_value).strip() if currency_value not in {None, ""} else ""
-            currency = currency or self.default_currency
+            currency = currency or default_currency
 
             description_value = _get("description")
             if isinstance(description_value, str):
@@ -558,6 +564,9 @@ class PriceListImporter:
         )
         used_columns = set(mapping.values())
 
+        parse_price = self._parse_price
+        default_currency = self.default_currency
+
         for item in products_data:
             if not isinstance(item, dict):
                 continue
@@ -588,7 +597,7 @@ class PriceListImporter:
             if not sku or not name or not price_str:
                 continue
 
-            price = self._parse_price(price_raw, sku)
+            price = parse_price(price_raw, sku)
 
             currency_value = self._extract_first_xml_value(_get("currency"))
             currency = (
@@ -596,7 +605,7 @@ class PriceListImporter:
                 if currency_value not in {None, ""}
                 else ""
             )
-            currency = currency or self.default_currency
+            currency = currency or default_currency
 
             description_value = self._extract_first_xml_value(_get("description"))
             if isinstance(description_value, str):
@@ -663,6 +672,17 @@ class PriceListImporter:
         mapping = self._prepare_column_mapping(headers, column_mapping, path)
         used_columns = set(mapping.values())
 
+        extract = self._extract_cell
+        parse_price = self._parse_price
+        default_currency = self.default_currency
+
+        sku_column = mapping["sku"]
+        name_column = mapping["name"]
+        price_column = mapping["price"]
+        currency_column = mapping.get("currency")
+        description_column = mapping.get("description")
+        tags_column = mapping.get("tags")
+
         for row_values in rows:
             if not any(row_values):
                 continue
@@ -672,28 +692,23 @@ class PriceListImporter:
                 for index in range(len(headers))
                 if headers[index]
             }
-            sku = self._extract_cell(row, mapping["sku"]).strip()
-            name = self._extract_cell(row, mapping["name"]).strip()
-            price_value = self._extract_cell(row, mapping["price"])
+            sku = extract(row, sku_column).strip()
+            name = extract(row, name_column).strip()
+            price_value = extract(row, price_column)
             price_str = str(price_value).strip()
 
             if not sku or not name or not price_str:
                 continue
 
-            currency_column = mapping.get("currency")
-            currency_value = self._extract_cell(row, currency_column) if currency_column else ""
-            currency = currency_value.strip() or self.default_currency
+            currency_value = extract(row, currency_column) if currency_column else ""
+            currency = currency_value.strip() or default_currency
 
-            description_column = mapping.get("description")
-            description_raw = (
-                self._extract_cell(row, description_column) if description_column else ""
-            )
+            description_raw = extract(row, description_column) if description_column else ""
             description = description_raw.strip() or None
 
-            tags_column = mapping.get("tags")
-            tags_raw = self._extract_cell(row, tags_column) if tags_column else ""
+            tags_raw = extract(row, tags_column) if tags_column else ""
 
-            price = self._parse_price(price_value, sku)
+            price = parse_price(price_value, sku)
 
             tags = {
                 tag.strip().lower()

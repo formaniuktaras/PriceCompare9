@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Set
 
 from .models import PriceList, Product
 
@@ -29,6 +29,10 @@ class PriceComparator:
 
     def __init__(self, price_lists: Sequence[PriceList]) -> None:
         self.price_lists = list(price_lists)
+        self._sku_index: Dict[str, List[Product]] = defaultdict(list)
+        self._sku_tokens: Dict[str, Set[str]] = defaultdict(set)
+        self._canonical_name: Dict[str, str] = {}
+        self._build_indexes()
 
     def compare_by_sku(self, sku: str) -> ComparisonEntry | None:
         sku_lower = sku.lower()
@@ -40,8 +44,9 @@ class PriceComparator:
             name = offers[0].name
         if not offers:
             return None
-        offers.sort(key=lambda product: product.price)
-        return ComparisonEntry(sku=sku, name=name, offers=offers)
+        offers_sorted = sorted(offers, key=lambda product: product.price)
+        canonical = offers_sorted[0]
+        return ComparisonEntry(sku=canonical.sku, name=canonical.name, offers=offers_sorted)
 
     def compare_by_name(self, name: str, *, threshold: float = 0.75) -> List[ComparisonEntry]:
         name_lower = name.lower()

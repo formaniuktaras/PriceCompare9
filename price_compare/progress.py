@@ -41,6 +41,9 @@ class ProgressTracker:
         self._pause_event.set()
         self._cancelled = False
         self._finished = False
+        self._last_sample_time = self._start_time
+        self._last_sample_done = 0
+        self._smoothed_ips = 0.0
 
     # ------------------------------------------------------------------
     # Control methods
@@ -57,6 +60,9 @@ class ProgressTracker:
             self._finished = False
             self._cancelled = False
             self._pause_event.set()
+            self._last_sample_time = self._start_time
+            self._last_sample_done = 0
+            self._smoothed_ips = 0.0
 
     def set_total(self, total: int) -> None:
         with self._lock:
@@ -146,36 +152,57 @@ class ProgressTracker:
             paused_since = self._paused_since
             paused_duration = self._paused_duration
             start = self._start_time
+            last_sample_time = self._last_sample_time
+            last_sample_done = self._last_sample_done
+            smoothed_ips = self._smoothed_ips
+            now = time.monotonic()
 
-        now = time.monotonic()
-        if paused and paused_since is not None:
-            effective_paused = paused_duration + (now - paused_since)
-        else:
-            effective_paused = paused_duration
-        elapsed = max(now - start - effective_paused, 0.0)
-        ips = (done / elapsed) if elapsed > 0 else 0.0
-        left = max(total - done, 0)
-        eta_seconds: Optional[float]
-        if finished or ips <= 0:
-            eta_seconds = None
-        else:
-            eta_seconds = left / ips if total else None
+            if paused and paused_since is not None:
+                effective_paused = paused_duration + (now - paused_since)
+            else:
+                effective_paused = paused_duration
+            elapsed = max(now - start - effective_paused, 0.0)
 
-        fraction = (done / total) if total > 0 else (1.0 if finished else 0.0)
-        if fraction > 1.0:
-            fraction = 1.0
+            delta_time = max(now - last_sample_time, 1e-9)
+            delta_done = max(done - last_sample_done, 0)
+            instant_ips = (delta_done / delta_time) if delta_time > 0 else 0.0
 
-        return ProgressSnapshot(
-            done=done,
-            total=total,
-            left=left,
-            fraction=fraction,
-            is_paused=paused,
-            is_cancelled=cancelled,
-            is_finished=finished,
-            ips=ips,
-            eta_seconds=eta_seconds,
-        )
+            if instant_ips > 0.0:
+                if smoothed_ips <= 0.0:
+                    smoothed_ips = instant_ips
+                else:
+                    smoothing = 0.35
+                    smoothed_ips = (smoothing * instant_ips) + ((1.0 - smoothing) * smoothed_ips)
+            elif now - last_sample_time > 1.0:
+                smoothed_ips = 0.0
+
+            self._last_sample_time = now
+            self._last_sample_done = done
+            self._smoothed_ips = smoothed_ips
+
+            ips = smoothed_ips if smoothed_ips > 0.0 else ((done / elapsed) if elapsed > 0 else 0.0)
+            left = max(total - done, 0)
+            eta_seconds: Optional[float]
+            if finished or ips <= 0:
+                eta_seconds = None
+            else:
+                eta_seconds = left / ips if total else None
+
+            fraction = (done / total) if total > 0 else (1.0 if finished else 0.0)
+            if fraction > 1.0:
+                fraction = 1.0
+
+            return ProgressSnapshot(
+                done=done,
+                total=total,
+                left=left,
+                fraction=fraction,
+                is_paused=paused,
+                is_cancelled=cancelled,
+                is_finished=finished,
+                ips=ips,
+                eta_seconds=eta_seconds,
+            )
 
     # Convenience properties -------------------------------------------------
     @property

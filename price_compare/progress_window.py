@@ -67,7 +67,15 @@ class ProgressWindow(tk.Toplevel):
         poll_interval_ms: int = 350,
     ) -> None:
         super().__init__(master)
-        self.transient(master)
+        windowing_system = self.tk.call("tk", "windowingsystem")
+        if windowing_system != "win32":
+            self.transient(master)
+        else:
+            try:
+                self.wm_attributes("-topmost", True)
+                self.after(200, lambda: self.wm_attributes("-topmost", False))
+            except tk.TclError:
+                pass
         self.title(title)
         self.resizable(False, False)
         self._tracker = tracker
@@ -79,7 +87,13 @@ class ProgressWindow(tk.Toplevel):
         container.pack(fill=tk.BOTH, expand=True)
 
         self.status_var = tk.StringVar(value="Опрацьовано 0/0. Залишилось 0. ETA: — ~0 ел/с")
-        status_label = ttk.Label(container, textvariable=self.status_var, justify=tk.LEFT)
+        status_label = ttk.Label(
+            container,
+            textvariable=self.status_var,
+            justify=tk.LEFT,
+            width=76,
+            anchor=tk.W,
+        )
         status_label.pack(fill=tk.X)
 
         self.progress = ttk.Progressbar(
@@ -110,7 +124,7 @@ class ProgressWindow(tk.Toplevel):
         )
         self.cancel_button.grid(row=0, column=1, padx=(0, 6))
 
-        ttk.Button(buttons, text="Згорнути", command=self.iconify, width=16).grid(
+        ttk.Button(buttons, text="Згорнути", command=self._minimize, width=16).grid(
             row=0, column=2
         )
 
@@ -118,7 +132,7 @@ class ProgressWindow(tk.Toplevel):
         buttons.columnconfigure(1, weight=1)
         buttons.columnconfigure(2, weight=1)
 
-        self.protocol("WM_DELETE_WINDOW", self.iconify)
+        self.protocol("WM_DELETE_WINDOW", self._minimize)
 
         self.update_idletasks()
         try:
@@ -133,7 +147,7 @@ class ProgressWindow(tk.Toplevel):
         except tk.TclError:
             pass
 
-        self._schedule_refresh()
+        self._refresh()
 
     # ------------------------------------------------------------------
     # UI actions
@@ -147,6 +161,15 @@ class ProgressWindow(tk.Toplevel):
         self._tracker.cancel()
         self.pause_button.state(["disabled"])
         self.cancel_button.state(["disabled"])
+
+    def _minimize(self) -> None:
+        try:
+            self.wm_state("iconic")
+        except tk.TclError:
+            try:
+                self.withdraw()
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
