@@ -104,3 +104,38 @@ def test_match_models_ignores_matches_contained_in_longer_ones() -> None:
 
     assert "iPhone 15 Pro Max" in tags
     assert "iPhone 15 Pro" not in tags
+
+
+def test_match_models_finds_repeated_model_mentions_without_brand() -> None:
+    templates = [
+        ModelTemplate(
+            category="Phones",
+            brand="Xiaomi",
+            name="Redmi Note 7",
+            pattern=generate_model_pattern("Xiaomi", "Redmi Note 7"),
+            tags=["Xiaomi Redmi Note 7"],
+        ),
+        ModelTemplate(
+            category="Phones",
+            brand="Xiaomi",
+            name="Redmi Note 7 Pro",
+            pattern=generate_model_pattern("Xiaomi", "Redmi Note 7 Pro"),
+            tags=["Xiaomi Redmi Note 7 Pro"],
+        ),
+        ModelTemplate(
+            category="Phones",
+            brand="Xiaomi",
+            name="Redmi Note 7S",
+            pattern=generate_model_pattern("Xiaomi", "Redmi Note 7S"),
+            tags=["Xiaomi Redmi Note 7S"],
+        ),
+    ]
+
+    tags = match_models(
+        "Чохол TPU GETMAN Liquid Silk Full Camera для Xiaomi Redmi Note 7 / Note 7 Pro / Note 7s",
+        templates,
+    )
+
+    assert "Xiaomi Redmi Note 7" in tags
+    assert "Xiaomi Redmi Note 7 Pro" in tags
+    assert "Xiaomi Redmi Note 7S" in tags

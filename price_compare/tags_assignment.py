@@ -44,6 +44,7 @@ class ModelTemplate:
 
     _regex: re.Pattern[str] | None = field(init=False, repr=False)
     _token_sequence: tuple[str, ...] = field(init=False, repr=False)
+    _name_token_sequence: tuple[str, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         try:
@@ -51,6 +52,15 @@ class ModelTemplate:
         except re.error:
             self._regex = None
         self._token_sequence = self._extract_tokens()
+
+    def _extract_tokens_from_text(self, text: str) -> tuple[str, ...]:
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for token in _TOKEN_PATTERN.findall(str(text).lower()):
+            if token and token not in seen:
+                seen.add(token)
+                tokens.append(token)
+        return tuple(tokens)
 
     def iter_matches(self, text: str) -> Sequence[re.Match[str]]:
         if not self._regex:
@@ -82,18 +92,24 @@ class ModelTemplate:
         return len(self._token_sequence), total_length
 
     def _extract_tokens(self) -> tuple[str, ...]:
-        tokens: list[str] = []
+        brand_tokens = self._extract_tokens_from_text(self.brand)
+        name_tokens = self._extract_tokens_from_text(self.name)
         seen: set[str] = set()
-        for part in (self.brand, self.name):
-            for token in _TOKEN_PATTERN.findall(str(part).lower()):
-                if token and token not in seen:
-                    seen.add(token)
-                    tokens.append(token)
-        return tuple(tokens)
+        combined: list[str] = []
+        for token in list(brand_tokens) + list(name_tokens):
+            if token and token not in seen:
+                seen.add(token)
+                combined.append(token)
+        self._name_token_sequence = name_tokens
+        return tuple(combined)
 
     @property
     def token_sequence(self) -> tuple[str, ...]:
         return self._token_sequence
+
+    @property
+    def name_token_sequence(self) -> tuple[str, ...]:
+        return self._name_token_sequence
 
 
 @dataclass
@@ -435,13 +451,38 @@ def _find_token_spans(
                 if token_values[probe] == token:
                     next_idx = probe
                     break
-            if next_idx is None:
+            if next_idx is None or next_idx != current_idx + 1:
                 found = False
                 break
             current_idx = next_idx
         if found:
             spans.append((start_idx, current_idx))
     return spans
+
+
+def _is_valid_subsequence(tokens: Sequence[str]) -> bool:
+    if not tokens:
+        return False
+    if len(tokens) >= 2:
+        return True
+    token = tokens[0]
+    has_alpha = any(char.isalpha() for char in token)
+    has_digit = any(char.isdigit() for char in token)
+    return len(token) >= 3 and has_alpha and has_digit
+
+
+def _iter_candidate_sequences(template: ModelTemplate) -> Iterable[tuple[str, ...]]:
+    primary = template.token_sequence
+    if primary:
+        yield primary
+
+    name_tokens = template.name_token_sequence
+    if name_tokens:
+        yield name_tokens
+        for start in range(1, len(name_tokens)):
+            candidate = name_tokens[start:]
+            if _is_valid_subsequence(candidate):
+                yield candidate
 
 
 def _collect_distinct_matches(
@@ -463,18 +504,24 @@ def _collect_distinct_matches(
             )
             for match in template.iter_matches(haystack)
         ]
-        if not template_matches and template.token_sequence:
-            for start_idx, end_idx in _find_token_spans(template.token_sequence, token_values):
-                start_char = token_iter[start_idx].start()
-                end_char = token_iter[end_idx].end()
-                template_matches.append(
-                    _TemplateMatch(
-                        start=start_char,
-                        end=end_char,
-                        kind="tokens",
-                        template=template,
+        if not template_matches:
+            seen_spans: set[tuple[int, int]] = set()
+            for sequence in _iter_candidate_sequences(template):
+                for start_idx, end_idx in _find_token_spans(sequence, token_values):
+                    span = (start_idx, end_idx)
+                    if span in seen_spans:
+                        continue
+                    seen_spans.add(span)
+                    start_char = token_iter[start_idx].start()
+                    end_char = token_iter[end_idx].end()
+                    template_matches.append(
+                        _TemplateMatch(
+                            start=start_char,
+                            end=end_char,
+                            kind="tokens",
+                            template=template,
+                        )
                     )
-                )
         raw_matches.extend(template_matches)
 
     if not raw_matches:
