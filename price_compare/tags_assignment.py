@@ -155,6 +155,14 @@ DEFAULT_TAG_RULES_PAYLOAD: Dict[str, List[Dict[str, object]]] = {
 }
 
 
+@dataclass
+class _TemplateMatch:
+    start: int
+    end: int
+    kind: str
+    template: ModelTemplate
+
+
 TYPE_TAGS = {
     "чохол",
     "плівка",
@@ -407,8 +415,101 @@ def find_best_model_match(
     return find_best_template_match(product_name, models_list)
 
 
+def _find_token_spans(
+    sequence: Sequence[str], token_values: Sequence[str]
+) -> List[tuple[int, int]]:
+    """Return spans of token indexes where ``sequence`` appears in order."""
+
+    if not sequence or not token_values:
+        return []
+
+    spans: List[tuple[int, int]] = []
+    first = sequence[0]
+    start_positions = [idx for idx, value in enumerate(token_values) if value == first]
+    for start_idx in start_positions:
+        current_idx = start_idx
+        found = True
+        for token in sequence[1:]:
+            next_idx = None
+            for probe in range(current_idx + 1, len(token_values)):
+                if token_values[probe] == token:
+                    next_idx = probe
+                    break
+            if next_idx is None:
+                found = False
+                break
+            current_idx = next_idx
+        if found:
+            spans.append((start_idx, current_idx))
+    return spans
+
+
+def _collect_distinct_matches(
+    haystack: str, templates: Sequence[ModelTemplate]
+) -> List[ModelTemplate]:
+    """Return templates that have non-contained regex or token matches."""
+
+    token_iter = list(_TOKEN_PATTERN.finditer(haystack.lower()))
+    token_values = [match.group(0) for match in token_iter]
+
+    raw_matches: List[_TemplateMatch] = []
+    for template in templates:
+        template_matches = [
+            _TemplateMatch(
+                start=match.start(),
+                end=match.end(),
+                kind="regex",
+                template=template,
+            )
+            for match in template.iter_matches(haystack)
+        ]
+        if not template_matches and template.token_sequence:
+            for start_idx, end_idx in _find_token_spans(template.token_sequence, token_values):
+                start_char = token_iter[start_idx].start()
+                end_char = token_iter[end_idx].end()
+                template_matches.append(
+                    _TemplateMatch(
+                        start=start_char,
+                        end=end_char,
+                        kind="tokens",
+                        template=template,
+                    )
+                )
+        raw_matches.extend(template_matches)
+
+    if not raw_matches:
+        return []
+
+    distinct: List[ModelTemplate] = []
+    for match in raw_matches:
+        contained = False
+        for other in raw_matches:
+            if other is match:
+                continue
+            if other.start <= match.start and other.end >= match.end and (
+                other.start < match.start or other.end > match.end
+            ):
+                if match.kind == "regex" and other.kind == "tokens":
+                    continue
+                contained = True
+                break
+        if not contained and match.template not in distinct:
+            distinct.append(match.template)
+    return distinct
+
+
 def match_models(product_name: str, templates: Sequence[ModelTemplate]) -> Set[str]:
-    """Return a set of tags derived from the best matching model template."""
+    """Return tags for all templates matching the product name."""
+
+    haystack = product_name or ""
+    matched_templates = _collect_distinct_matches(haystack, templates)
+    if matched_templates:
+        return {
+            tag
+            for template in matched_templates
+            for tag in template.tags
+            if tag
+        }
 
     template = find_best_template_match(product_name, templates)
     if not template:

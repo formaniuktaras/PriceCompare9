@@ -45,3 +45,62 @@ def test_generate_model_pattern_allows_missing_separators() -> None:
 
     assert regex.search("TPU для Samsung GalaxyS23FE (2023)")
     assert regex.search("Чохол Samsung Galaxy-S23 FE")
+
+
+def test_match_models_returns_multiple_distinct_matches() -> None:
+    templates = [
+        ModelTemplate(
+            category="Phones",
+            brand="Xiaomi",
+            name="Redmi 10X 5G",
+            pattern=generate_model_pattern("Xiaomi", "Redmi 10X 5G"),
+            tags=["Xiaomi Redmi 10X 5G"],
+        ),
+        ModelTemplate(
+            category="Phones",
+            brand="Xiaomi",
+            name="Redmi 10X Pro 5G",
+            pattern=generate_model_pattern("Xiaomi", "Redmi 10X Pro 5G"),
+            tags=["Xiaomi Redmi 10X Pro 5G"],
+        ),
+        ModelTemplate(
+            category="Phones",
+            brand="Xiaomi",
+            name="Redmi 10",
+            pattern=generate_model_pattern("Xiaomi", "Redmi 10"),
+            tags=["Xiaomi Redmi 10"],
+        ),
+    ]
+
+    tags = match_models(
+        "Захисна плівка SKLO Back (тил) Snake (тех.пак) для Xiaomi Redmi 10X 5G /10X Pro 5G",
+        templates,
+    )
+
+    assert "Xiaomi Redmi 10X 5G" in tags
+    assert "Xiaomi Redmi 10X Pro 5G" in tags
+    assert "Xiaomi Redmi 10" not in tags
+
+
+def test_match_models_ignores_matches_contained_in_longer_ones() -> None:
+    templates = [
+        ModelTemplate(
+            category="Phones",
+            brand="Apple",
+            name="iPhone 15 Pro",
+            pattern=generate_model_pattern("Apple", "iPhone 15 Pro"),
+            tags=["iPhone 15 Pro"],
+        ),
+        ModelTemplate(
+            category="Phones",
+            brand="Apple",
+            name="iPhone 15 Pro Max",
+            pattern=generate_model_pattern("Apple", "iPhone 15 Pro Max"),
+            tags=["iPhone 15 Pro Max"],
+        ),
+    ]
+
+    tags = match_models("Чохол для Apple iPhone 15 Pro Max", templates)
+
+    assert "iPhone 15 Pro Max" in tags
+    assert "iPhone 15 Pro" not in tags
