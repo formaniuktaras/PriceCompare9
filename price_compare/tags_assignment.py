@@ -464,6 +464,9 @@ def _is_valid_subsequence(tokens: Sequence[str]) -> bool:
     if not tokens:
         return False
     if len(tokens) >= 2:
+        first_token = tokens[0]
+        if not any(char.isalpha() for char in first_token):
+            return False
         return True
     token = tokens[0]
     has_alpha = any(char.isalpha() for char in token)

@@ -139,3 +139,30 @@ def test_match_models_finds_repeated_model_mentions_without_brand() -> None:
     assert "Xiaomi Redmi Note 7" in tags
     assert "Xiaomi Redmi Note 7 Pro" in tags
     assert "Xiaomi Redmi Note 7S" in tags
+
+
+def test_match_models_does_not_drop_leading_alpha_tokens() -> None:
+    templates = [
+        ModelTemplate(
+            category="Tablets",
+            brand="Xiaomi",
+            name="Pad 7 Pro",
+            pattern=generate_model_pattern("Xiaomi", "Pad 7 Pro"),
+            tags=["Xiaomi Pad 7 Pro"],
+        ),
+        ModelTemplate(
+            category="Phones",
+            brand="Xiaomi",
+            name="Redmi Note 7 Pro",
+            pattern=generate_model_pattern("Xiaomi", "Redmi Note 7 Pro"),
+            tags=["Xiaomi Redmi Note 7 Pro"],
+        ),
+    ]
+
+    tags = match_models(
+        "Скло Ceramic для Xiaomi Redmi Note 7 / Note 7 Pro / Note 7S (without pad)",
+        templates,
+    )
+
+    assert "Xiaomi Redmi Note 7 Pro" in tags
+    assert "Xiaomi Pad 7 Pro" not in tags
