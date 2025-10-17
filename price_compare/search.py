@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from functools import lru_cache
-from typing import Dict, Iterator, List, Sequence, Set
+from typing import List, Sequence, Set
 
 from .models import PriceList, Product
+
+
+_WORD_PATTERN = re.compile(r"\w+", re.UNICODE)
 
 
 @dataclass
@@ -22,15 +25,14 @@ class ProductSearch:
 
     def __init__(self, price_lists: Sequence[PriceList]) -> None:
         self.price_lists = list(price_lists)
-        self._product_by_id: Dict[int, Product] = {}
-        self._supplier_index: Dict[int, str] = {}
-        self._sku_index: Dict[str, Set[int]] = defaultdict(set)
-        self._token_index: Dict[str, Set[int]] = defaultdict(set)
+        self._sku_index: dict[str, Set[Product]] = {}
         for price_list in self.price_lists:
-            supplier_lower = price_list.supplier_lower
             for product in price_list.products:
-                self._register_product(product, supplier_lower)
-        self._fuzzy_cache: Dict[tuple[str, int], float] = {}
+                self._register_product(product)
+
+    def _register_product(self, product: Product) -> None:
+        if product.sku_lower:
+            self._sku_index.setdefault(product.sku_lower, set()).add(product)
 
     def search(
         self,
@@ -42,12 +44,17 @@ class ProductSearch:
         threshold: float = 0.6,
     ) -> List[SearchResult]:
         query_lower = query.lower().strip()
+        if not query_lower:
+            return []
+
+        supplier_lists = self._filter_suppliers(supplier)
+        query_tokens = tuple(_WORD_PATTERN.findall(query_lower))
+        candidates = self._collect_candidates(query_lower, query_tokens, supplier_lists)
+        if not candidates:
+            return []
+
         results: List[SearchResult] = []
-        supplier_lower = supplier.lower() if supplier else None
-
-        candidate_ids = self._collect_candidate_ids(query_lower)
-        candidates = self._iter_candidates(candidate_ids, supplier_lower)
-
+        token_set = set(query_tokens)
         if fuzzy:
             for product in candidates:
                 score = self._fuzzy_score(query_lower, product)
@@ -55,73 +62,62 @@ class ProductSearch:
                     results.append(SearchResult(product=product, score=score))
         else:
             for product in candidates:
-                if query_lower in product.search_haystack:
+                if query_lower in product.haystack_lower or (
+                    token_set and token_set.issubset(product.search_token_set)
+                ):
                     results.append(SearchResult(product=product, score=1.0))
 
         results.sort(key=lambda result: (-result.score, result.product.price))
         return results[:limit]
 
-    # ------------------------------------------------------------------
-    # Internal helpers
+    def _filter_suppliers(self, supplier: str | None) -> Sequence[PriceList]:
+        if not supplier:
+            return self.price_lists
+        supplier_lower = supplier.lower()
+        return [
+            price_list
+            for price_list in self.price_lists
+            if price_list.supplier.lower() == supplier_lower
+        ]
 
-    def _register_product(self, product: Product, supplier_lower: str) -> None:
-        self._product_by_id[product.product_id] = product
-        self._supplier_index[product.product_id] = supplier_lower
-        self._sku_index[product.sku_lower].add(product.product_id)
-        for token in product.search_tokens:
-            if token:
-                self._token_index[token].add(product.product_id)
+    def _collect_candidates(
+        self,
+        query_lower: str,
+        query_tokens: Sequence[str],
+        price_lists: Sequence[PriceList],
+    ) -> Set[Product]:
+        candidates: Set[Product] = set()
 
-    def _iter_candidates(
-        self, candidate_ids: Set[int], supplier_lower: str | None
-    ) -> Iterator[Product]:
-        if candidate_ids:
-            yielded = False
-            for product_id in candidate_ids:
-                if supplier_lower and self._supplier_index[product_id] != supplier_lower:
-                    continue
-                yielded = True
-                yield self._product_by_id[product_id]
-            if yielded:
-                return
+        if query_lower in self._sku_index:
+            candidates.update(self._sku_index[query_lower])
 
-        if supplier_lower is None:
-            yield from self._product_by_id.values()
+        if query_tokens:
+            for price_list in price_lists:
+                candidates.update(price_list.candidates_for_tokens(query_tokens))
         else:
-            for product_id, product in self._product_by_id.items():
-                if self._supplier_index[product_id] == supplier_lower:
-                    yield product
+            for price_list in price_lists:
+                candidates.update(price_list.products)
 
-    def _collect_candidate_ids(self, query_lower: str) -> Set[int]:
-        candidate_ids: Set[int] = set()
-        if not query_lower:
-            return candidate_ids
+        if not candidates and query_tokens:
+            for price_list in price_lists:
+                candidates.update(price_list.products)
 
-        candidate_ids.update(self._sku_index.get(query_lower, set()))
-        for token in self._tokens_for_query(query_lower):
-            candidate_ids.update(self._token_index.get(token, set()))
-        if not candidate_ids and " " in query_lower:
-            for part in (segment for segment in query_lower.split() if segment):
-                candidate_ids.update(self._token_index.get(part, set()))
-        return candidate_ids
+        return candidates
 
-    @lru_cache(maxsize=2048)
-    def _tokens_for_query(self, query: str) -> tuple[str, ...]:
-        if not query:
-            return tuple()
-        return tuple(token for token in self._token_index if query in token)
+    @staticmethod
+    @lru_cache(maxsize=8192)
+    def _compute_fuzzy_score(
+        query: str, cache_key: str, haystack_lower: str, tokens: tuple[str, ...]
+    ) -> float:
+        scores = [SequenceMatcher(None, query, token).ratio() for token in tokens]
+        if haystack_lower:
+            scores.append(SequenceMatcher(None, query, haystack_lower).ratio())
+        return max(scores) if scores else 0.0
 
     def _fuzzy_score(self, query: str, product: Product) -> float:
-        key = (query, product.product_id)
-        if key in self._fuzzy_cache:
-            return self._fuzzy_cache[key]
-
-        scores = [SequenceMatcher(None, query, token).ratio() for token in product.search_tokens]
-        if product.search_haystack:
-            scores.append(SequenceMatcher(None, query, product.search_haystack).ratio())
-        score = max(scores) if scores else 0.0
-
-        if len(self._fuzzy_cache) > 4096:
-            self._fuzzy_cache.clear()
-        self._fuzzy_cache[key] = score
-        return score
+        return self._compute_fuzzy_score(
+            query,
+            product.cache_key,
+            product.haystack_lower,
+            product.search_tokens,
+        )
