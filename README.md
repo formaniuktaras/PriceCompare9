@@ -153,10 +153,19 @@ make test-export
    pip install pyinstaller
    ```
 
-2. Запустіть збірку у режимі одного файлу без консольного вікна:
+2. Очистіть попередні артефакти та запустіть збірку. Найпростіше скористатися
+   допоміжним скриптом, який автоматично видаляє каталоги `build/` і `dist/` та
+   викликає PyInstaller:
 
    ```bash
-   pyinstaller --onefile --noconsole main.py
+   python scripts/build_exe.py
+   ```
+
+   За потреби передайте шлях до власного `.spec`-файлу або додаткові параметри
+   PyInstaller. Наприклад:
+
+   ```bash
+   python scripts/build_exe.py --spec PriceCompare.spec -- --noconfirm
    ```
 
    > **Примітка щодо швидкості запуску.** У режимі `--onefile` PyInstaller пакує всі
