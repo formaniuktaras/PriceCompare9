@@ -8,6 +8,35 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, MutableMapping, Optional, Sequence
 
+try:  # pragma: no cover - optional dependency
+    from openpyxl import Workbook, load_workbook
+except Exception:  # pragma: no cover - optional dependency
+    Workbook = None  # type: ignore[assignment]
+    load_workbook = None  # type: ignore[assignment]
+
+
+_EXCEL_HEADERS = (
+    "Категорія",
+    "Теги категорії",
+    "Бренд",
+    "Теги бренду",
+    "Модель",
+    "Теги моделі",
+    "Патерн",
+)
+
+
+def _split_tags(value: object) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        parts = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        raw = str(value)
+        parts = [part.strip() for part in raw.replace("\n", ";").replace(",", ";").split(";")]
+        parts = [part for part in parts if part]
+    return parts
+
 
 def _normalize_tags(tags: Iterable[str]) -> List[str]:
     """Return a list with duplicate tags removed while preserving order."""
@@ -291,6 +320,182 @@ class ModelTemplatesEditor:
                     )
 
     # ------------------------------------------------------------------
+    # Excel import/export
+    # ------------------------------------------------------------------
+    def export_to_excel(self, path: str | Path) -> None:
+        """Export the current model list into an Excel workbook."""
+
+        if Workbook is None:
+            raise ValueError(
+                "Експорт у Excel недоступний. Встановіть залежність 'openpyxl'."
+            )
+
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        workbook = Workbook()
+        try:
+            sheet = workbook.active
+            sheet.title = "Models"
+            sheet.append(_EXCEL_HEADERS)
+
+            for record in self.iter_model_records():
+                category = self._get_category(record.category) or {}
+                brand = self._get_brand(record.category, record.brand) or {}
+                category_tags = _normalize_tags(category.get("tags", []))
+                brand_tags = _normalize_tags(brand.get("tags", []))
+                row = [
+                    record.category,
+                    "; ".join(category_tags),
+                    record.brand,
+                    "; ".join(brand_tags),
+                    record.name,
+                    "; ".join(record.tags),
+                    record.pattern,
+                ]
+                sheet.append(row)
+
+            workbook.save(destination)
+        finally:  # pragma: no branch - ensure closure under normal operation
+            try:
+                workbook.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    def import_from_excel(self, path: str | Path) -> None:
+        """Replace current templates with the contents of an Excel workbook."""
+
+        if load_workbook is None:
+            raise ValueError(
+                "Імпорт із Excel недоступний. Встановіть залежність 'openpyxl'."
+            )
+
+        source = Path(path)
+        if not source.exists():
+            raise FileNotFoundError(f"Файл '{source}' не знайдено")
+
+        workbook = load_workbook(source, read_only=True, data_only=True)
+        try:
+            try:
+                sheet = workbook.active
+            except AttributeError as exc:  # pragma: no cover - defensive
+                raise ValueError("Файл Excel не містить активного аркуша") from exc
+
+            rows = sheet.iter_rows(
+                min_row=1, max_col=len(_EXCEL_HEADERS), values_only=True
+            )
+            try:
+                header = next(rows)
+            except StopIteration:
+                self.data = {"categories": []}
+                return
+
+            normalized_header = [
+                str(value).strip().lower() if value is not None else ""
+                for value in header
+            ]
+            expected_header = [value.lower() for value in _EXCEL_HEADERS]
+            if normalized_header[: len(expected_header)] != expected_header:
+                raise ValueError(
+                    "Невірний формат файлу Excel: перший рядок має містити заголовки "
+                    + ", ".join(_EXCEL_HEADERS)
+                )
+
+            categories: Dict[str, Dict[str, object]] = {}
+            seen_models: set[tuple[str, str, str]] = set()
+
+            for index, row in enumerate(rows, start=2):
+                if row is None:
+                    continue
+                values = list(row) + [None] * (len(_EXCEL_HEADERS) - len(row))
+                category_name = str(values[0]).strip() if values[0] is not None else ""
+                brand_name = str(values[2]).strip() if values[2] is not None else ""
+                model_name = str(values[4]).strip() if values[4] is not None else ""
+
+                if not category_name:
+                    if all(cell is None or str(cell).strip() == "" for cell in values):
+                        continue
+                    raise ValueError(f"Рядок {index}: відсутня назва категорії")
+                if not brand_name:
+                    raise ValueError(f"Рядок {index}: відсутня назва бренду")
+                if not model_name:
+                    raise ValueError(f"Рядок {index}: відсутня назва моделі")
+
+                key = (
+                    category_name.lower(),
+                    brand_name.lower(),
+                    model_name.lower(),
+                )
+                if key in seen_models:
+                    raise ValueError(
+                        f"Рядок {index}: модель '{model_name}' для бренду '{brand_name}' "
+                        f"у категорії '{category_name}' дублюється"
+                    )
+                seen_models.add(key)
+
+                category_entry = categories.setdefault(
+                    category_name,
+                    {"name": category_name, "tags": [], "brands": {}},
+                )
+                category_tags = _split_tags(values[1])
+                if category_tags:
+                    category_entry["tags"].extend(category_tags)
+                else:
+                    category_entry["tags"].append(category_name)
+
+                brands = category_entry.setdefault("brands", {})  # type: ignore[assignment]
+                brand_entry = brands.setdefault(
+                    brand_name,
+                    {"name": brand_name, "tags": [], "models": {}},
+                )
+                brand_tags = _split_tags(values[3])
+                if brand_tags:
+                    brand_entry["tags"].extend(brand_tags)
+                else:
+                    brand_entry["tags"].append(brand_name)
+
+                model_tags = _split_tags(values[5])
+                if not model_tags:
+                    model_tags = [category_name, brand_name, model_name]
+                pattern_value = str(values[6]).strip() if values[6] is not None else ""
+                model_data = {
+                    "name": model_name,
+                    "pattern": pattern_value or generate_model_pattern(brand_name, model_name),
+                    "tags": model_tags,
+                }
+                models = brand_entry.setdefault("models", {})  # type: ignore[assignment]
+                models[model_name] = model_data
+
+            structured_categories: List[Dict[str, object]] = []
+            for category_name, category_data in categories.items():
+                brands_map: Dict[str, Dict[str, object]] = category_data.get("brands", {})  # type: ignore[assignment]
+                brand_list: List[Dict[str, object]] = []
+                for brand_name, brand_data in brands_map.items():
+                    models_map: Dict[str, Dict[str, object]] = brand_data.get("models", {})  # type: ignore[assignment]
+                    models_list = list(models_map.values())
+                    brand_list.append(
+                        {
+                            "name": brand_name,
+                            "tags": brand_data.get("tags", []),
+                            "models": models_list,
+                        }
+                    )
+                structured_categories.append(
+                    {
+                        "name": category_name,
+                        "tags": category_data.get("tags", []),
+                        "brands": brand_list,
+                    }
+                )
+
+            self.data = {"categories": self._normalize_structure(structured_categories)}
+        finally:
+            try:
+                workbook.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    # ------------------------------------------------------------------
     # Mutators
     # ------------------------------------------------------------------
     def add_category(self, name: str) -> None:
@@ -502,4 +707,3 @@ __all__ = [
     "ModelTemplatesEditor",
     "generate_model_pattern",
 ]
-
