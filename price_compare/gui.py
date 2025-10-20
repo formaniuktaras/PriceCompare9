@@ -1861,9 +1861,20 @@ class ModelTemplatesDialog(tk.Toplevel):
         footer.columnconfigure(0, weight=1)
         self.status_var = tk.StringVar(value="")
         ttk.Label(footer, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
-        ttk.Button(footer, text="Закрити", command=self._on_close).grid(
-            row=0, column=1, sticky="e"
-        )
+
+        footer_buttons = ttk.Frame(footer)
+        footer_buttons.grid(row=0, column=1, sticky="e")
+        ttk.Button(
+            footer_buttons,
+            text="Експорт у Excel",
+            command=self._export_models_to_excel,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(
+            footer_buttons,
+            text="Імпорт з Excel",
+            command=self._import_models_from_excel,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(footer_buttons, text="Закрити", command=self._on_close).pack(side=tk.LEFT)
 
         self.category_list.bind("<<ListboxSelect>>", self._on_category_select)
         self.brand_list.bind("<<ListboxSelect>>", self._on_brand_select)
@@ -2179,6 +2190,66 @@ class ModelTemplatesDialog(tk.Toplevel):
         self._mark_modified()
         self.selected_model = None
         self._refresh_models()
+
+    def _export_models_to_excel(self) -> None:
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Експорт моделей",
+            defaultextension=".xlsx",
+            filetypes=(("Excel", "*.xlsx"), ("Усі файли", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            self.manager.export_to_excel(path)
+        except ValueError as exc:
+            messagebox.showerror("Шаблони моделей", str(exc), parent=self)
+            return
+        except OSError as exc:
+            messagebox.showerror(
+                "Шаблони моделей",
+                f"Не вдалося зберегти файл: {exc}",
+                parent=self,
+            )
+            return
+        messagebox.showinfo(
+            "Шаблони моделей",
+            "Список моделей успішно експортовано.",
+            parent=self,
+        )
+
+    def _import_models_from_excel(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Імпорт моделей",
+            filetypes=(("Excel", "*.xlsx"), ("Усі файли", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            self.manager.import_from_excel(path)
+            self.manager.save_data()
+        except FileNotFoundError as exc:
+            messagebox.showerror("Шаблони моделей", str(exc), parent=self)
+            return
+        except ValueError as exc:
+            messagebox.showerror("Шаблони моделей", str(exc), parent=self)
+            return
+        except OSError as exc:
+            messagebox.showerror(
+                "Шаблони моделей",
+                f"Не вдалося прочитати файл: {exc}",
+                parent=self,
+            )
+            return
+
+        self._mark_modified()
+        self._refresh_categories()
+        messagebox.showinfo(
+            "Шаблони моделей",
+            "Список моделей імпортовано.",
+            parent=self,
+        )
 
 _CONDITION_PATTERN = re.compile(
     r"REGEXMATCH\s*\(\s*\{\{\s*name\s*\}\}\s*,\s*(?P<literal>(\"(?:\\.|[^\"])*\")|('(?:\\.|[^'])*'))\s*\)",
